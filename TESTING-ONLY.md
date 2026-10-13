@@ -7,7 +7,7 @@ evaluation purposes only**.
 - It is **NOT for production use, commercial use, or any "fair use"
   reliance**. Do not depend on it for real workloads.
 - It talks to **unofficial, reverse-engineered web-app endpoints** of
-  OpenAI (ChatGPT) and Google (Gemini). These can change, rate-limit, or
+  OpenAI (ChatGPT). These can change, rate-limit, or
   block automated use at any time — breakage is expected, not a bug.
 - **No warranty of any kind** (see `LICENSE`). Availability, accuracy,
   and continuity are not guaranteed.

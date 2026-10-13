@@ -1,12 +1,10 @@
 services:
-  gemini-web2api:
+  chatgpt-web2api:
     build: .
-    container_name: gemini-web2api
+    container_name: chatgpt-web2api
     ports:
-      - "8000:8000"
+      - "8100:8100"
     volumes:
-      - ./config.json:/app/config.json:ro
-      # - ./cookie.txt:/app/cookie.txt:ro   # uncomment and set "cookie_file": "cookie.txt" in config.json
+      - ./chatgptwebapp2api/config.json:/app/chatgptwebapp2api/config.json:ro
+      # - ./chatgptwebapp2api/gpt_cookie.txt:/app/chatgptwebapp2api/gpt_cookie.txt:ro
     restart: unless-stopped
-    # NOTE: on Docker Desktop, Gemini may reject requests from NAT'd IP ranges.
-    # If you keep getting 403/429 from upstream, try --network host (Linux).

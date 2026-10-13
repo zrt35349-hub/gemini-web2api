@@ -60,18 +60,23 @@ def _safe_msg(exc, limit=300):
         msg = msg[:limit] + "..."
     return msg or "unknown error"
 
-# Client names ChatGPT web does not know → nearest web equivalent.
+# Client names ChatGPT web does not know → nearest live web equivalent
+# (live slugs: auto, gpt-6, gpt-6-mini, gpt-5-5, gpt-5-6,
+#  gpt-5-5-mini, gpt-5-6-mini, gpt-5-3-mini).
 _MODEL_ALIASES = {
     "gpt-3.5-turbo": "auto",
     "gpt-4": "auto",
     "gpt-4-turbo": "auto",
-    "gpt-4o": "auto",
-    "gpt-4o-mini": "auto",
-    "gpt-4.1": "auto",
-    "gpt-4.1-mini": "auto",
+    "gpt-4o": "gpt-6",
+    "gpt-4o-mini": "gpt-6-mini",
+    "gpt-4.1": "gpt-6",
+    "gpt-4.1-mini": "gpt-6-mini",
+    "gpt-5": "gpt-5-5",
+    "gpt-5-mini": "gpt-5-5-mini",
+    "o4-mini": "gpt-5-3-mini",
 }
-_FALLBACK_MODELS = ["auto", "gpt-5", "gpt-5-mini", "gpt-4o", "gpt-4o-mini",
-                    "gpt-4.1", "gpt-4.1-mini", "o4-mini"]
+_FALLBACK_MODELS = ["auto", "gpt-6", "gpt-6-mini", "gpt-5-5", "gpt-5-6",
+                    "gpt-5-5-mini", "gpt-5-6-mini", "gpt-5-3-mini"]
 _PROMPT_BUDGETS_BYTES = (78000, 58000, 43000, 32000, 24000)
 _OMITTED_HISTORY_NOTICE = (
     "[Some earlier conversation history was omitted to fit the request size limit. "

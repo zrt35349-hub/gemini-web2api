@@ -161,7 +161,8 @@ class Config:
             raise FileNotFoundError("cookie_file not configured")
         if not os.path.isabs(path):
             here = os.path.dirname(os.path.abspath(self.config_path or "config.json"))
-            for base in (here, os.getcwd()):
+            pkg = os.path.dirname(os.path.abspath(__file__))
+            for base in (here, pkg, os.getcwd()):
                 cand = os.path.join(base, path)
                 if os.path.exists(cand):
                     path = cand

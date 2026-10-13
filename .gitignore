@@ -8,7 +8,6 @@ venv/
 config.json
 cookie.txt
 gpt_cookie.txt
-gemini-auth.json
 .env
 server.log
 auth_server.log

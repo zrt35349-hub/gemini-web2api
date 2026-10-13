@@ -49,7 +49,7 @@ curl http://localhost:8100/v1/chat/completions \
 
 ## Config options (`config.json`)
 
-- `port` — default `8100` (Gemini wala 8000 pe alag chalta hai)
+- `port` — default `8100`
 - `host` — default `127.0.0.1` (sirf aapke PC se). LAN ke liye `0.0.0.0`
 - `api_keys` — khali = open. List do to `Authorization: Bearer <key>` lagana hoga
 - `temporary_chats` — `true` (default) = ChatGPT history me chat save NAHI hogi
