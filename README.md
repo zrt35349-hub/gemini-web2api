@@ -315,3 +315,12 @@ Variables se aati hain. Binna cookie Railway par anonymous Flash models chalenge
   rate-limit/block.
 - Reverse-engineered private endpoint use karna Google ToS ke daayare se bahar ho
   sakta hai — **personal use me hi rakho.**
+
+## License
+
+- Apna code **MIT License** me hai — dekho `LICENSE` (root + dono packages
+  `gemini_web2api/LICENSE`, `chatgptwebapp2api/LICENSE` me copy hai).
+- Trademark/ToS attribution aur user-responsibility notes: `NOTICE`.
+- Dependency licenses: `THIRD-PARTY-LICENSES.md`.
+- "ChatGPT" (OpenAI) aur "Gemini" (Google) unke owners ke trademarks hain;
+  ye project unofficial hai, unse affiliated nahi.

@@ -1,0 +1,39 @@
+NOTICE — trademarks, affiliation and terms of use
+=========================================================
+
+1. Unofficial project
+---------------------
+This repository (`gemini-web2api`, containing the `gemini_web2api` and
+`chatgptwebapp2api` packages) is an independent, unofficial project. It is
+NOT affiliated with, endorsed by, or sponsored by OpenAI or Google.
+
+2. Trademark attribution
+------------------------
+- "ChatGPT" and related marks are trademarks of OpenAI.
+- "Gemini" and related marks are trademarks of Google.
+All trademarks and brand names referenced here (including in package names,
+documentation and log messages) belong to their respective owners and are
+used only to describe compatibility with those services.
+
+3. How the software works (important)
+------------------------------------
+Both proxies talk to the providers' **web-app (browser) endpoints** using
+reverse-engineered, undocumented internal protocols — NOT the official
+paid APIs. These private endpoints can change, rate-limit, or block automated
+use at any time without notice.
+
+4. Your responsibility
+----------------------
+- Use of this software must comply with the providers' terms:
+  - OpenAI Terms of Use: https://openai.com/policies/terms-of-use
+  - Google Terms of Service: https://policies.google.com/terms
+- You are responsible for the cookies/credentials you paste into
+  `cookie.txt` / `gpt_cookie.txt` / `COOKIE_STRING`. Never commit them
+  (they are gitignored) and never share them.
+- Reverse-engineered private-endpoint use may fall outside the providers'
+  Terms of Service — keep usage personal and low-key.
+
+5. No warranty
+--------------
+The software is provided "AS IS" under the MIT License (see LICENSE),
+without warranty of any kind.
