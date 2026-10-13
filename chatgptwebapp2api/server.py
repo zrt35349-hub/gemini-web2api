@@ -216,6 +216,14 @@ class App:
                     self.client.update_cookie(fresh)
             except Exception:
                 pass
+            try:
+                # hot-reload proxy (config.json edit / CHATGPT_PROXY change
+                # picked up on next load_config-style refresh without restart)
+                if hasattr(self.client, "update_proxy"):
+                    current = getattr(self.config, "proxy", None)
+                    self.client.update_proxy(current)
+            except Exception:
+                pass
 
     def note_request(self, queue_wait_ms=0.0, ttfb_ms=None, total_ms=0.0, ok=True):
         """Records one client request for the /health latency snapshot."""
@@ -429,14 +437,22 @@ class BodyTooLargeError(Exception):
 def make_handler(app):
     """Returns a request handler class bound to the given App."""
 
+    _handler_timeout = 600.0
+    try:
+        _handler_timeout = max(60.0, float(getattr(app.config, "handler_timeout_sec", 600.0) or 600.0))
+    except (TypeError, ValueError):
+        _handler_timeout = 600.0
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         # Nagle off: small SSE chunks flush immediately instead of waiting on
         # delayed-ACK interaction (visible per-chunk latency on Windows)
         disable_nagle_algorithm = True
-        # idle keep-alive connections and stuck clients are reaped after 120s
-        # instead of pinning a pool worker forever (slowloris protection)
-        timeout = 120
+        # Long website builds stream for minutes: the socket timeout is an
+        # *idle* guard (no bytes at all), not a total budget. SSE keep-alives
+        # every ~15s keep healthy streams alive; only a truly dead socket is
+        # reaped. Slowloris is handled by bounded _read_body + admission shed.
+        timeout = _handler_timeout
         server_version = "chatgptwebapp2api/" + __version__
         _response_started = False
 
@@ -486,8 +502,10 @@ def make_handler(app):
         def _start_stream(self, content_type):
             self.send_response(200)
             self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", "no-cache, no-transform")
             self.send_header("Access-Control-Allow-Origin", "*")
+            # nginx / proxies must not buffer long website streams
+            self.send_header("X-Accel-Buffering", "no")
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
@@ -670,6 +688,10 @@ def make_handler(app):
                 port = int(getattr(cfg, "port", 0) or 0)
             except Exception:
                 port = 0
+            try:
+                proxy_val = getattr(cfg, "proxy", None) or None
+            except Exception:
+                proxy_val = None
             self._send_json({
                 "status": "ok",
                 "service": "chatgptwebapp2api",
@@ -678,6 +700,8 @@ def make_handler(app):
                 "cookie_file": cookie_path,
                 "device_id": device,
                 "models_cached": models_cached,
+                "proxy": proxy_val,
+                "proxy_active": bool(proxy_val),
                 "upstream_ok": state["upstream_ok"],
                 "load": app.load_snapshot(),
             })
@@ -755,17 +779,26 @@ def make_handler(app):
                 slot_held = True
                 try:
                     lane_busy = False
-                    exec_budget = float(getattr(app.config, "request_deadline_sec", 0) or 0)
-                    if exec_budget <= 0:
-                        exec_budget = 75.0
-                    # leave headroom for the HTTP framing around the upstream call
-                    exec_budget = max(5.0, exec_budget + 10.0)
+                    lane = app.lane_for(data, len(raw))
+                    is_stream = bool(data.get("stream"))
+                    setup_budget = float(getattr(app.config, "request_deadline_sec", 0) or 0)
+                    if setup_budget <= 0:
+                        setup_budget = 75.0
+                    max_stream = float(getattr(app.config, "max_stream_sec", 600.0) or 600.0)
+                    max_stream = max(60.0, max_stream)
+                    if is_stream or lane == "heavy":
+                        # Long sessions (website builds): survive while tokens
+                        # flow, up to max_stream_sec. Setup still fails fast
+                        # via request_deadline_sec inside the client.
+                        exec_budget = max_stream
+                    else:
+                        exec_budget = max(5.0, setup_budget + 10.0)
                     if app.agents is not None:
                         # execute the upstream part on a lane-bound agent:
                         # small chats never queue behind large-payload work
                         try:
                             app.agents.run(
-                                app.lane_for(data, len(raw)), runner, name=path,
+                                lane, runner, name=path,
                                 timeout=(app.agent_submit_wait_sec or 5.0),
                                 exec_timeout=exec_budget)
                         except PoolBusy:
@@ -867,6 +900,21 @@ def make_handler(app):
 
         # --------------------------------------------------- chat completions
 
+        def _stream_timeouts(self, prompt_chars=0):
+            """Lane-aware SSE guards: heavy/website builds think longer and
+            pause longer between tokens; express stays ultra-fast to fail."""
+            try:
+                lane = app.lane_for({}, prompt_chars)
+            except Exception:
+                lane = "standard"
+            base_first = float(getattr(app.config, "first_byte_timeout_sec", 20.0) or 20.0)
+            base_read = float(getattr(app.config, "stream_read_timeout_sec", 60.0) or 60.0)
+            if lane == "heavy":
+                return max(base_first, 60.0), max(base_read, 120.0)
+            if lane == "standard":
+                return max(base_first, 30.0), max(base_read, 90.0)
+            return base_first, base_read
+
         def _chat(self, data):
             cfg, client = app.config, app.client
             messages = data.get("messages")
@@ -892,10 +940,11 @@ def make_handler(app):
                     messages_to_prompt(messages)):
                 self._log("chat history compacted to fit upstream request limit")
 
+            first_to, read_to = self._stream_timeouts(len(prompt))
             if data.get("stream"):
-                self._stream_openai(resp, slug, t0)
+                self._stream_openai(resp, slug, t0, first_to, read_to)
             else:
-                self._collect_openai(resp, slug, len(prompt), t0)
+                self._collect_openai(resp, slug, len(prompt), t0, first_to, read_to)
 
         def _sse(self, obj):
             if isinstance(obj, str):
@@ -926,7 +975,7 @@ def make_handler(app):
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
             })
 
-        def _stream_openai(self, resp, slug, t0):
+        def _stream_openai(self, resp, slug, t0, first_byte_timeout=None, stream_read_timeout=None):
             cid = "chatcmpl-" + uuid.uuid4().hex[:24]
             created = int(time.time())
             self._start_stream("text/event-stream; charset=utf-8")
@@ -935,7 +984,10 @@ def make_handler(app):
             model_seen = slug
             try:
                 self._chunk(cid, created, model_seen, {"role": "assistant", "content": ""})
-                for delta in app.client.iter_deltas(resp, stream_state):
+                for delta in app.client.iter_deltas(
+                        resp, stream_state,
+                        first_byte_timeout=first_byte_timeout,
+                        stream_read_timeout=stream_read_timeout):
                     if delta:
                         self._chunk(cid, created, model_seen, {"content": delta})
                     if stream_state.get("model_slug"):
@@ -967,11 +1019,15 @@ def make_handler(app):
                                                     status=502)
                 self._sse_stream_error(self._upstream_error)
 
-        def _collect_openai(self, resp, slug, prompt_chars, t0):
+        def _collect_openai(self, resp, slug, prompt_chars, t0,
+                            first_byte_timeout=None, stream_read_timeout=None):
             stream_state = {}
             # non-streaming sends nothing until the end, so upstream errors
             # propagate to _route_post which maps them to the right status
-            for _ in app.client.iter_deltas(resp, stream_state):
+            for _ in app.client.iter_deltas(
+                    resp, stream_state,
+                    first_byte_timeout=first_byte_timeout,
+                    stream_read_timeout=stream_read_timeout):
                 pass
             text = stream_state.get("text", "")
             model_seen = stream_state.get("model_slug") or slug
@@ -1033,6 +1089,10 @@ def serve(cfg, client):
     print(" Base URL : http://localhost:%d/v1" % cfg.port)
     print(" Model    : %s (aur /v1/models me sab dikhenge)" % cfg.default_model)
     print(" Temporary chats: %s (ChatGPT history me save nahi hoga)" % ("ON" if cfg.temporary_chats else "OFF"))
+    if getattr(cfg, "proxy", None):
+        print(" Proxy    : %s (ChatGPT upstream via proxy)" % cfg.proxy)
+    else:
+        print(" Proxy    : OFF (direct ChatGPT connection)")
     if app.agents is not None:
         fleet = app.agents.describe()
         lanes = fleet["lanes"]

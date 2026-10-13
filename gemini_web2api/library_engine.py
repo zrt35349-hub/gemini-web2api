@@ -100,7 +100,7 @@ class LibraryEngine:
             try:
                 from gemini_webapi import GeminiClient as LibClient
                 cookie, _ = self._cookies.get()
-                client = LibClient(psid, psidts, proxy=self._config.proxy or None)
+                client = LibClient(psid, psidts)
                 client.cookies = self._cookie_jar(cookie)
                 if self._loop is None:
                     self._loop = asyncio.new_event_loop()

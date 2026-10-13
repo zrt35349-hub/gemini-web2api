@@ -99,7 +99,7 @@ class ChatGPTClient:
         self.cookie = cookie
         self.device_id = extract_device_id(cookie)
         self.timeout = float(timeout)
-        self._proxy = proxy
+        self._proxy = (proxy or "").strip() or None
         self._local = threading.local()
         self._tls = threading.local()  # per-thread deadline (never shared across requests)
         self._sentinel = Sentinel()
@@ -139,6 +139,29 @@ class ChatGPTClient:
             self._anon = None
             self._persona_ts = 0.0
         self._last_turnstile = None
+        return True
+
+    def update_proxy(self, proxy):
+        """Hot-swap the upstream proxy; recreates sessions on change.
+
+        Returns True when the proxy changed (per-thread sessions are
+        closed so the next request builds a new session with the new
+        proxy through the same ChatGPT models/endpoints).
+        """
+        norm = (proxy or "").strip() or None
+        if norm == self._proxy:
+            return False
+        self._proxy = norm
+        try:
+            sess = getattr(self._local, "session", None)
+            if sess is not None:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+                self._local.session = None
+        except Exception:
+            pass
         return True
 
     # -- sessions / headers -------------------------------------------------

@@ -164,7 +164,6 @@ digits `@think=0..4`.
   "default_model": "gemini-3.6-flash",
   "api_keys": [],             // ["sk-gemini"] = auth on
   "cookie_file": null,        // "cookie.txt"
-  "proxy": null,              // "http://127.0.0.1:7890" (Clash/V2Ray)
   "log_requests": true,
   "temporary_chats": false,   // true = history account me save nahi hogi
   "state_refresh_sec": 300,   // background BL+xsrf refresh (0 = off)
@@ -178,7 +177,7 @@ digits `@think=0..4`.
 }
 ```
 
-CLI: `--port`, `--host`, `--config`, `--cookie-file`, `--proxy`.
+CLI: `--port`, `--host`, `--config`, `--cookie-file`.
 Config search order: `--config` → `GEMINI_WEB2API_CONFIG` env → `./config.json` →
 `~/.config/gemini-web2api/config.json`.
 
@@ -282,7 +281,7 @@ cp config.example.json config.json
 docker compose up -d
 ```
 Docker Desktop par Gemini NAT IP ranges reject kar sakta hai → Linux par
-`--network host`, ya config me `proxy` set karo.
+`--network host` use karo.
 
 **Railway:**
 1. GitHub repo (`aryanhawari/gemini-web2api`) ko Railway se connect karo

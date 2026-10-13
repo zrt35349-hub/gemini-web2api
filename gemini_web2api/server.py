@@ -249,7 +249,7 @@ class App:
         """image specs -> [ref, filename] pairs for the payload. Raises UploadError (-> 502)."""
         refs = []
         for spec in images or []:
-            data, mime = resolve_image(spec, proxy=self.config.proxy)
+            data, mime = resolve_image(spec)
             mime = mime or detect_image_mime(data)
             if not mime:
                 raise UploadError("unsupported image format (magic bytes not recognised)")
@@ -267,7 +267,7 @@ class App:
         """image specs -> [(bytes, mime)] for the library engine."""
         pairs = []
         for spec in images or []:
-            data, mime = resolve_image(spec, proxy=self.config.proxy)
+            data, mime = resolve_image(spec)
             mime = mime or detect_image_mime(data)
             if not mime:
                 raise UploadError("unsupported image format (magic bytes not recognised)")
@@ -329,14 +329,21 @@ class BodyTooLargeError(Exception):
 def make_handler(app):
     """Returns a request handler class bound to the given App."""
 
+    _handler_timeout = 600.0
+    try:
+        _handler_timeout = max(60.0, float(getattr(app.config, "handler_timeout_sec", 600.0) or 600.0))
+    except (TypeError, ValueError):
+        _handler_timeout = 600.0
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         # Nagle off: small SSE chunks flush immediately instead of waiting on
         # delayed-ACK interaction (visible per-chunk latency on Windows)
         disable_nagle_algorithm = True
-        # idle keep-alive connections and stuck clients are reaped after 120s
-        # instead of pinning a pool worker forever (slowloris protection)
-        timeout = 120
+        # Long website builds stream for minutes: idle-socket guard only.
+        # SSE keep-alives keep healthy streams alive; bounded _read_body +
+        # admission shed handle slowloris.
+        timeout = _handler_timeout
         server_version = f"gemini-web2api/{__version__}"
         _response_started = False
 
@@ -375,8 +382,9 @@ def make_handler(app):
         def _start_stream(self, content_type):
             self.send_response(200)
             self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", "no-cache, no-transform")
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Accel-Buffering", "no")
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
@@ -585,17 +593,18 @@ def make_handler(app):
             queue_wait_ms = 0.0
             try:
                 wait_budget = app.queue_wait_sec
+                if wait_budget <= 0:
+                    wait_budget = 30.0
                 waited_at = time.monotonic()
-                if wait_budget > 0:
-                    acquired = app.limiter.acquire(timeout=wait_budget)
-                else:
-                    acquired = app.limiter.acquire()  # legacy: wait indefinitely
+                acquired = app.limiter.acquire(timeout=wait_budget)
                 queue_wait_ms = (time.monotonic() - waited_at) * 1000.0
                 if not acquired:
                     # fast, honest overload signal: a 429 + Retry-After beats
                     # parking the request behind a 30s queue (that queue wait is
                     # exactly what users see as "17s latency")
-                    retry_after = max(1, int(min(10.0, max(wait_budget, 1.0))))
+                    snap = app.limiter.describe()
+                    depth = max(1, int(snap.get("waiting", 0)) + 1)
+                    retry_after = max(1, int(min(10.0, max(wait_budget / max(1, depth), 1.0))))
                     self._send_json(
                         {"error": {
                             "message": ("server busy: all upstream slots are in use, "
@@ -606,22 +615,38 @@ def make_handler(app):
                 slot_held = True
                 try:
                     lane_busy = False
+                    max_stream = float(getattr(app.config, "max_stream_sec", 600.0) or 600.0)
+                    max_stream = max(60.0, max_stream)
                     if app.agents is not None:
                         # execute the upstream part on a lane-bound agent:
-                        # express jobs never queue behind heavy image/tool work
+                        # express jobs never queue behind heavy image/tool work.
+                        # exec wall = max_stream_sec: flowing website streams
+                        # survive, stuck upstreams can't pin agents forever.
                         try:
                             app.agents.run(
                                 app.lane_for(data, len(raw)), runner, name=path,
-                                timeout=(app.agent_submit_wait_sec or None))
+                                timeout=(app.agent_submit_wait_sec or 5.0),
+                                exec_timeout=max_stream)
                         except PoolBusy:
                             lane_busy = True
+                        except AgentError as exc:
+                            if "did not finish in time" in str(exc):
+                                raise UpstreamTimeoutError(
+                                    "agent execution timeout — upstream stalled")
+                            raise
                     else:
                         runner()
                     if lane_busy:
                         # lane queues saturated: same fast, honest overload signal
                         # as the admission gate (a 429 beats queueing silently)
+                        snap = app.agents.describe() if app.agents is not None else {}
+                        qd = 0
+                        try:
+                            qd = sum(l.get("queued", 0) for l in snap.get("lanes", {}).values())
+                        except Exception:
+                            qd = 0
                         retry_after = max(1, int(min(
-                            10.0, max(app.agent_submit_wait_sec, 1.0))))
+                            10.0, max(app.agent_submit_wait_sec, 1.0) + min(5, qd // 4))))
                         self._send_json(
                             {"error": {
                                 "message": ("server busy: the agent lanes are "

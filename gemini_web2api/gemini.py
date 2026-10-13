@@ -396,8 +396,6 @@ class GeminiClient:
             with self._client_lock:
                 if self._curl_client is None and HAVE_CURL_CFFI:
                     kwargs = {"timeout": self.cfg.request_timeout_sec}
-                    if self.cfg.proxy:
-                        kwargs["proxies"] = {"http": self.cfg.proxy, "https": self.cfg.proxy}
                     self._curl_client = CurlSession(impersonate="chrome", **kwargs)
         return self._curl_client
 
@@ -436,13 +434,7 @@ class GeminiClient:
                             keepalive_expiry=KEEPALIVE_EXPIRY_SEC),
                         headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
                     )
-                    if self.cfg.proxy:
-                        try:
-                            self._http_client = httpx.Client(proxy=self.cfg.proxy, **common)
-                        except TypeError:  # httpx < 0.26
-                            self._http_client = httpx.Client(proxies=self.cfg.proxy, **common)
-                    else:
-                        self._http_client = httpx.Client(**common)
+                    self._http_client = httpx.Client(**common)
         return self._http_client
 
     def _urllib_request(self, method, url, body=None, headers=None):
@@ -452,11 +444,7 @@ class GeminiClient:
         merged.update(headers or {})
         for key, value in merged.items():
             req.add_header(key, value)
-        handlers = []
-        if self.cfg.proxy:
-            handlers.append(urllib.request.ProxyHandler(
-                {"http": self.cfg.proxy, "https": self.cfg.proxy}))
-        opener = urllib.request.build_opener(*handlers)
+        opener = urllib.request.build_opener()
         with opener.open(req, timeout=self.cfg.request_timeout_sec) as resp:
             return resp.read().decode("utf-8", "replace")
 
@@ -747,7 +735,11 @@ class GeminiClient:
             read = float(self.cfg.request_timeout_sec)
         remaining = self._remaining(deadline)
         if remaining is not None:
-            read = min(read, max(1.0, remaining))
+            # Flowing streams survive on progress: never collapse the read
+            # window below 10s near the setup deadline. Setup/retries stay
+            # bounded by _sleep_before_retry + _check_deadline; the 600s
+            # server agent wall caps the total session.
+            read = min(read, max(10.0, remaining))
         return self._timeout(read)
 
     def _sleep_before_retry(self, attempt, exc, deadline):
@@ -975,11 +967,12 @@ class GeminiClient:
     def stream_events(self, prompt, file_refs=None, model_info=None):
         """Yields ('thought', delta) / ('text', delta) events.
 
-        Retries only before the first text delta; thought-only progress does
-        not block a retry (a repeated thinking trace is cosmetic, an empty
-        answer is not). All attempts share one overall deadline, and a silent
-        start is hedged, so a single slow upstream connection can no longer
-        stretch the client-visible latency.
+        Setup (xsrf + first byte + retries) is bounded by request_deadline_sec
+        for ultra-fast fail. Once tokens flow the session survives on progress
+        (first-byte / idle-gap guards only) up to the server's max_stream_sec
+        wall — a multi-minute website build is never cut while it keeps
+        emitting. A silent start is hedged, so a single slow upstream
+        connection can no longer stretch the client-visible latency.
         """
         if self._http() is None:  # no httpx -> non-streaming fallback
             yield ("text", self.generate(prompt, file_refs, model_info))
@@ -997,18 +990,27 @@ class GeminiClient:
         attempts = max(1, self.cfg.retry_attempts)
         for attempt in range(attempts):
             text_emitted = False
+            saw_any = False
             try:
                 for kind, delta in iter_events(self._hedged_lines(inner, deadline)):
+                    saw_any = True
                     if kind == "text":
                         text_emitted = True
-                    else:
-                        self._check_deadline(deadline, "stream")
+                    # NOTE: no _check_deadline here — thoughts AND text are
+                    # both progress. Killing a thinking website-build at 75s
+                    # while it keeps emitting is exactly the session-cut bug.
+                    # Idle gaps are killed by stream_read_timeout; the total
+                    # session is capped by the server agent wall (600s).
                     yield kind, delta
                 if not text_emitted:
                     raise RetryableError("Gemini returned an empty stream.", kind="empty")
                 return
             except (RetryableError, RateLimitedError, GeminiError) as exc:
                 last = exc
+                if text_emitted or saw_any and isinstance(exc, UpstreamTimeoutError):
+                    # progress was made: surface in-band, never retry a
+                    # half-built website from scratch
+                    raise
                 if text_emitted:
                     raise
                 self._recover(exc)

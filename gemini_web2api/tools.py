@@ -84,7 +84,7 @@ def _content_to_text(content):
     return str(content), []
 
 
-def resolve_image(spec, proxy=None, timeout=30):
+def resolve_image(spec, timeout=30):
     """Turns an image spec {source|data, mime} into (bytes, mime_or_None)."""
     if spec.get("data"):
         return spec["data"], spec.get("mime")
@@ -98,7 +98,7 @@ def resolve_image(spec, proxy=None, timeout=30):
         mime = header[5:].split(";", 1)[0] or None
         return _b64decode(b64), mime
     if src.startswith(("http://", "https://")):
-        return _download_image(src, proxy, timeout), None
+        return _download_image(src, timeout), None
     cleaned = re.sub(r"\s+", "", src)
     if len(cleaned) >= 64:  # raw base64 blob without a data: prefix
         try:
@@ -108,10 +108,10 @@ def resolve_image(spec, proxy=None, timeout=30):
     raise PromptError(f"unsupported image source: {src[:80]}")
 
 
-def _download_image(url, proxy=None, timeout=30):
+def _download_image(url, timeout=30):
     try:
         import httpx
-        with httpx.Client(proxy=proxy, timeout=timeout, follow_redirects=True) as client:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             resp = client.get(url)
             resp.raise_for_status()
             return resp.content
@@ -122,9 +122,7 @@ def _download_image(url, proxy=None, timeout=30):
     except Exception as exc:
         raise PromptError(f"failed to download image {url[:80]}: {exc}")
     import urllib.request
-    handlers = ([urllib.request.ProxyHandler({"http": proxy, "https": proxy})]
-                if proxy else [])
-    opener = urllib.request.build_opener(*handlers)
+    opener = urllib.request.build_opener()
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with opener.open(req, timeout=timeout) as resp:

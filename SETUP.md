@@ -12,7 +12,7 @@ pip install httpx        # sirf ye ek dependency (streaming ke liye)
 ```bash
 python -m gemini_web2api             # default: http://0.0.0.0:8000
 # ya options ke saath:
-python -m gemini_web2api --port 8000 --cookie-file cookie.txt --proxy http://127.0.0.1:7890
+python -m gemini_web2api --port 8000 --cookie-file cookie.txt
 ```
 
 Anonymous mode me turant chal jayega (Flash models). Verify:
@@ -75,7 +75,6 @@ cp config.example.json config.json
 | `api_keys` | `[]` | empty = no auth; `["sk-x"]` = Bearer/x-api-key/`?key=` auth |
 | `default_model` | gemini-3.6-flash | unknown model ka fallback |
 | `cookie_file` | null | cookie.txt / cookie.json path |
-| `proxy` | null | Clash/V2Ray jaisa HTTP proxy |
 | `retry_attempts` / `retry_delay_sec` | 3 / 2 | upstream fail par retry (exponential backoff ke saath) |
 | `request_timeout_sec` | 180 | upstream timeout |
 | `temporary_chats` | false | true = history account me save nahi hogi |
@@ -136,7 +135,7 @@ docker compose up -d          # http://localhost:8000
 ```
 
 Agar upstream 403/429 de (Docker Desktop NAT IP ranges Gemini reject karta hai):
-Linux par `network_mode: host`, ya config.json me ek `proxy` set karo.
+Linux par `network_mode: host` use karo.
 
 ## 7. Tests
 
@@ -148,11 +147,11 @@ python -m unittest discover -s tests     # 100+ tests — sab mocked, bina netwo
 
 | Symptom | Matlab / Fix |
 |---|---|
-| `Could not extract build label` | gemini.google.com tumhare network se nahi khul raha (proxy lagao) ya page layout badal gaya |
+| `Could not extract build label` | gemini.google.com tumhare network se nahi khul raha ya page layout badal gaya |
 | `upstream 405` | build label expire — auto-refresh hota hai; baar-baar aaye to server restart |
 | `upstream 400` | xsrf token — cookie ke saath auto-refresh hota hai; kai baar fail ho to cookies dobara copy karo |
 | `upstream 403` | cookies missing/rejected — naya cookie copy karo, ya anonymous raho |
-| `upstream 429` | rate limit — cookies lagao, `retry_delay_sec` badhao, ya proxy rotate karo |
+| `upstream 429` | rate limit — cookies lagao, `retry_delay_sec` badhao |
 | Image upload fails | images ke liye cookie zaroori (`__Secure-1PSID` cookie.txt me) + `pip install gemini-webapi`; `http://localhost:8000/` par `"images": "ready"` hona chahiye |
 | Pro model Flash jaisa behave karta hai | expected — Pro ke liye Gemini Advanced cookie chahiye |
 | Streaming ek hi chunk me | tools use kar rahe ho ya image bheji hai — full response chahiye (by design) |

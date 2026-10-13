@@ -32,7 +32,8 @@ INT_FIELDS = {"port", "retry_attempts", "request_timeout_sec", "models_refresh_s
 FLOAT_FIELDS = {"retry_delay_sec", "queue_wait_sec", "request_deadline_sec",
                 "first_byte_timeout_sec", "stream_read_timeout_sec",
                 "hedge_after_sec", "max_retry_wait_sec", "sse_keepalive_sec",
-                "latency_target_sec", "agent_submit_wait_sec", "max_body_mb"}
+                "latency_target_sec", "agent_submit_wait_sec", "max_body_mb",
+                "max_stream_sec", "handler_timeout_sec"}
 BOOL_FIELDS = {"log_requests", "temporary_chats", "adaptive_concurrency",
                "agents_enabled", "strict_models"}
 
@@ -60,14 +61,14 @@ class Config:
     adaptive_concurrency: bool = True
     hedge_max_inflight: int = 2
     queue_wait_sec: float = 5.0
-    pool_workers: int = 128
+    pool_workers: int = 160
     pool_queue_depth: int = 1024
 
     # -- agent fleet (parallel lane-scheduled upstream executors) ----------
     agents_enabled: bool = True
-    agents_express: int = 6
-    agents_standard: int = 20
-    agents_heavy: int = 6
+    agents_express: int = 8
+    agents_standard: int = 24
+    agents_heavy: int = 8
     agent_queue_depth: int = 256
     agent_submit_wait_sec: float = 5.0
     lane_express_chars: int = 4000
@@ -75,12 +76,19 @@ class Config:
 
     # -- latency guards ----------------------------------------------------
     request_deadline_sec: float = 75.0
-    first_byte_timeout_sec: float = 15.0
-    stream_read_timeout_sec: float = 30.0
+    first_byte_timeout_sec: float = 20.0
+    stream_read_timeout_sec: float = 60.0
     hedge_after_sec: float = 3.5
     max_retry_wait_sec: float = 3.0
     sse_keepalive_sec: float = 15.0
     latency_target_sec: float = 7.0
+    # -- long-session guards (website-size generations) --------------------
+    # Setup (requirements + conversation POST + retries) stays bounded by
+    # request_deadline_sec for ultra-fast fail. Once the first delta flows,
+    # the session survives on progress (idle gap kills) up to max_stream_sec —
+    # a 4-8 min website build never gets cut while tokens keep arriving.
+    max_stream_sec: float = 600.0
+    handler_timeout_sec: float = 600.0
 
     max_body_mb: float = 10.0
     strict_models: bool = False
@@ -98,6 +106,10 @@ class Config:
     def __post_init__(self):
         if self.api_keys is None:
             self.api_keys = []
+        if not (self.proxy or "").strip():
+            self.proxy = None
+        elif isinstance(self.proxy, str):
+            self.proxy = self.proxy.strip()
         # keep the admission-control range sane whatever the config file says
         self.max_concurrent_requests = max(1, int(self.max_concurrent_requests or 1))
         self.min_concurrent_requests = max(
@@ -117,6 +129,16 @@ class Config:
         self.lane_express_chars = max(1, int(self.lane_express_chars or 1))
         self.lane_heavy_chars = max(self.lane_express_chars,
                                     int(self.lane_heavy_chars or self.lane_express_chars))
+        # long-session budgets: never let a bad config disable long streams
+        # or pin the socket forever
+        try:
+            self.max_stream_sec = max(60.0, float(self.max_stream_sec or 600.0))
+        except (TypeError, ValueError):
+            self.max_stream_sec = 600.0
+        try:
+            self.handler_timeout_sec = max(60.0, float(self.handler_timeout_sec or 600.0))
+        except (TypeError, ValueError):
+            self.handler_timeout_sec = 600.0
 
     # ------------------------------------------------------------------
     # Cookie handling
@@ -232,6 +254,8 @@ _FLOAT_ENV = {
     "SSE_KEEPALIVE_SEC": "sse_keepalive_sec",
     "LATENCY_TARGET_SEC": "latency_target_sec",
     "AGENT_SUBMIT_WAIT_SEC": "agent_submit_wait_sec",
+    "MAX_STREAM_SEC": "max_stream_sec",
+    "HANDLER_TIMEOUT_SEC": "handler_timeout_sec",
 }
 _BOOL_ENV = {
     "TEMPORARY_CHATS": "temporary_chats",
@@ -285,6 +309,10 @@ def _apply_env_overrides(cfg: Config, env: dict) -> None:
     raw_proxy = env.get("CHATGPT_PROXY", "").strip()
     if raw_proxy:
         cfg.proxy = raw_proxy
+    if not (cfg.proxy or "").strip():
+        cfg.proxy = None
+    else:
+        cfg.proxy = cfg.proxy.strip()
 
     for env_name, field in _INT_ENV.items():
         raw = str(env.get(env_name, "")).strip()
@@ -385,6 +413,6 @@ def apply_args(cfg: Config, args) -> Config:
     if getattr(args, "cookie_file", None):
         cfg.cookie_file = args.cookie_file
     if getattr(args, "proxy", None):
-        cfg.proxy = args.proxy
+        cfg.proxy = (args.proxy or "").strip() or None
     cfg.__post_init__()
     return cfg

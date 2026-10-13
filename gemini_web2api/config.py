@@ -24,7 +24,8 @@ INT_FIELDS = {"port", "retry_attempts", "request_timeout_sec", "auth_user",
 FLOAT_FIELDS = {"retry_delay_sec", "queue_wait_sec", "request_deadline_sec",
                 "first_byte_timeout_sec", "stream_read_timeout_sec",
                 "hedge_after_sec", "max_retry_wait_sec", "sse_keepalive_sec",
-                "latency_target_sec", "agent_submit_wait_sec"}
+                "latency_target_sec", "agent_submit_wait_sec",
+                "max_stream_sec", "handler_timeout_sec"}
 BOOL_FIELDS = {"log_requests", "temporary_chats", "adaptive_concurrency",
                "agents_enabled"}
 
@@ -43,7 +44,6 @@ class Config:
     api_keys: List[str] = None               # empty list = no auth
     cookie_file: Optional[str] = None        # cookie.txt path
     cookie_string: Optional[str] = None      # full Cookie header (env COOKIE_STRING)
-    proxy: Optional[str] = None              # e.g. http://127.0.0.1:7890
     log_requests: bool = True
     temporary_chats: bool = False            # true = history not saved on the account
     state_refresh_sec: int = 300             # background bl/xsrf refresh cadence (0 = off)
@@ -55,14 +55,14 @@ class Config:
     adaptive_concurrency: bool = True        # False = fixed initial limit
     hedge_max_inflight: int = 2              # global cap on tail-latency hedge calls
     queue_wait_sec: float = 5.0              # max wait for a slot before 429 (0 = forever)
-    pool_workers: int = 128                  # HTTP worker threads serving connections
+    pool_workers: int = 160                  # HTTP worker threads serving connections
     pool_queue_depth: int = 1024             # accepted-but-not-yet-served connections
 
     # -- agent fleet (parallel lane-scheduled upstream executors) ----------
     agents_enabled: bool = True              # False = run requests inline (legacy)
-    agents_express: int = 6                  # agents reserved for small/fast requests
-    agents_standard: int = 20                # agents for normal traffic
-    agents_heavy: int = 6                    # agents for images / tools / big payloads
+    agents_express: int = 8                  # agents reserved for small/fast requests
+    agents_standard: int = 24                # agents for normal traffic
+    agents_heavy: int = 8                    # agents for images / tools / big payloads
     agent_queue_depth: int = 256             # max queued jobs per lane before 429
     agent_submit_wait_sec: float = 5.0       # max wait for a lane slot (0 = forever)
     lane_express_chars: int = 4000           # body bytes <= this -> express lane
@@ -70,12 +70,16 @@ class Config:
 
     # -- latency guards -----------------------------------------------------
     request_deadline_sec: float = 75.0       # whole-call budget incl. retries (0 = off)
-    first_byte_timeout_sec: float = 15.0     # abort a stream with no upstream byte (0 = off)
-    stream_read_timeout_sec: float = 30.0    # max silence between streamed events
+    first_byte_timeout_sec: float = 20.0     # abort a stream with no upstream byte (0 = off)
+    stream_read_timeout_sec: float = 60.0    # max silence between streamed events
     hedge_after_sec: float = 3.5             # race a 2nd attempt if silent this long (0 = off)
     max_retry_wait_sec: float = 3.0          # never sleep longer than this inside a slot
     sse_keepalive_sec: float = 15.0          # SSE keep-alive comment cadence (0 = off)
     latency_target_sec: float = 7.0          # health/reporting target (not a hard cap)
+    # long sessions: setup stays bounded by request_deadline_sec; once deltas
+    # flow the stream survives on progress up to max_stream_sec (website builds)
+    max_stream_sec: float = 600.0
+    handler_timeout_sec: float = 600.0
 
     max_body_mb: float = 10.0                # request body size limit
     strict_models: bool = True               # unknown model name -> 400 (else fallback)
@@ -99,6 +103,14 @@ class Config:
         self.agents_heavy = max(0, int(self.agents_heavy or 0))
         self.agent_queue_depth = max(1, int(self.agent_queue_depth or 1))
         self.agent_submit_wait_sec = max(0.0, float(self.agent_submit_wait_sec or 0.0))
+        try:
+            self.max_stream_sec = max(60.0, float(self.max_stream_sec or 600.0))
+        except (TypeError, ValueError):
+            self.max_stream_sec = 600.0
+        try:
+            self.handler_timeout_sec = max(60.0, float(self.handler_timeout_sec or 600.0))
+        except (TypeError, ValueError):
+            self.handler_timeout_sec = 600.0
         self.lane_express_chars = max(1, int(self.lane_express_chars or 1))
         self.lane_heavy_chars = max(self.lane_express_chars,
                                     int(self.lane_heavy_chars or self.lane_express_chars))
@@ -139,6 +151,8 @@ _FLOAT_ENV = {
     "SSE_KEEPALIVE_SEC": "sse_keepalive_sec",
     "LATENCY_TARGET_SEC": "latency_target_sec",
     "AGENT_SUBMIT_WAIT_SEC": "agent_submit_wait_sec",
+    "MAX_STREAM_SEC": "max_stream_sec",
+    "HANDLER_TIMEOUT_SEC": "handler_timeout_sec",
 }
 _BOOL_ENV = {
     "TEMPORARY_CHATS": "temporary_chats",
@@ -278,7 +292,6 @@ def parse_args(argv=None):
     parser.add_argument("--host", help="bind address (default 0.0.0.0)")
     parser.add_argument("--config", help="path to config.json")
     parser.add_argument("--cookie-file", help="path to cookie file (header string or JSON)")
-    parser.add_argument("--proxy", help="proxy URL, e.g. http://127.0.0.1:7890")
     return parser.parse_args(argv)
 
 
@@ -289,8 +302,6 @@ def apply_args(cfg: Config, args) -> Config:
         cfg.host = args.host
     if getattr(args, "cookie_file", None):
         cfg.cookie_file = args.cookie_file
-    if getattr(args, "proxy", None):
-        cfg.proxy = args.proxy
     cfg.__post_init__()
     return cfg
 

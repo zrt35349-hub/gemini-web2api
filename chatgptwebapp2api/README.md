@@ -54,6 +54,7 @@ curl http://localhost:8100/v1/chat/completions \
 - `api_keys` — khali = open. List do to `Authorization: Bearer <key>` lagana hoga
 - `temporary_chats` — `true` (default) = ChatGPT history me chat save NAHI hogi
 - `default_model` — jab client koi model na de
+- `proxy` — upstream proxy, e.g. `http://127.0.0.1:7890` (config.json / `CHATGPT_PROXY` env / `--proxy`)
 
 ## Limitations
 
