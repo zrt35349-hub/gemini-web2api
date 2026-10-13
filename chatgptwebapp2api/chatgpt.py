@@ -26,6 +26,7 @@ Retry / latency:
 """
 
 import json
+import random
 import re
 import threading
 import time
@@ -93,25 +94,52 @@ def extract_device_id(cookie):
 
 class ChatGPTClient:
     def __init__(self, cookie, proxy=None, timeout=300.0, retry_attempts=2,
-                 retry_delay_sec=1.0, limiter=None):
+                 retry_delay_sec=1.0, limiter=None, max_retry_wait_sec=3.0,
+                 first_byte_timeout_sec=15.0, stream_read_timeout_sec=30.0):
         self.cookie = cookie
         self.device_id = extract_device_id(cookie)
         self.timeout = float(timeout)
         self._proxy = proxy
         self._local = threading.local()
+        self._tls = threading.local()  # per-thread deadline (never shared across requests)
         self._sentinel = Sentinel()
         self._models_lock = threading.Lock()
         self._models = []
         self._models_ts = 0.0
+        self._models_fetching = False
         self._persona_lock = threading.Lock()
         self._anon = None  # None = unknown, True = anonymous device identity
+        self._persona_ts = 0.0
+        self._persona_ttl = 600.0  # re-validate anon/logged-in at most every 10 min
         self._last_turnstile = None
         # --- retry / latency configuration ---
         self.retry_attempts = max(1, int(retry_attempts or 1))
         self.retry_delay_sec = float(retry_delay_sec or 0.0)
         self.limiter = limiter  # optional AdaptiveConcurrency injected by the server
-        self._deadline = None  # request-wide deadline (monotonic), set per conversation
         self._last_retry_after = 0.0
+        self.max_retry_wait_sec = max(0.5, float(max_retry_wait_sec or 3.0))
+        self.first_byte_timeout_sec = max(0.0, float(first_byte_timeout_sec or 0.0))
+        self.stream_read_timeout_sec = max(0.0, float(stream_read_timeout_sec or 0.0))
+
+    @property
+    def _deadline(self):
+        return getattr(self._tls, "deadline", None)
+
+    @_deadline.setter
+    def _deadline(self, value):
+        self._tls.deadline = value
+
+    def update_cookie(self, cookie):
+        """Hot-swap the cookie jar without a restart (rotation-safe)."""
+        if not cookie or cookie == self.cookie:
+            return False
+        self.cookie = cookie
+        self.device_id = extract_device_id(cookie)
+        with self._persona_lock:
+            self._anon = None
+            self._persona_ts = 0.0
+        self._last_turnstile = None
+        return True
 
     # -- sessions / headers -------------------------------------------------
     @property
@@ -135,8 +163,9 @@ class ChatGPTClient:
             "sec-ch-ua": SEC_CH_UA,
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
-            "Cookie": self.cookie,
         }
+        if self.cookie:
+            h["Cookie"] = self.cookie
         if self.device_id:
             h["oai-device-id"] = self.device_id
         if with_body:
@@ -145,7 +174,15 @@ class ChatGPTClient:
 
     @property
     def base(self):
-        return BASE + ("/backend-anon" if self._anon else "/backend-api")
+        with self._persona_lock:
+            anon = self._anon
+        return BASE + ("/backend-anon" if anon else "/backend-api")
+
+    def invalidate_persona(self):
+        """Forget the cached anon/logged-in routing (call on 401/403)."""
+        with self._persona_lock:
+            self._anon = None
+            self._persona_ts = 0.0
 
     def _raise_for_status(self, resp, what):
         code = resp.status_code
@@ -156,6 +193,12 @@ class ChatGPTClient:
         except Exception:
             snippet = ""
         if code in (401, 403):
+            # auth may have rotated — force re-detection on the next request
+            # instead of sticking to a stale anon/logged-in route forever
+            try:
+                self.invalidate_persona()
+            except Exception:
+                pass
             if _looks_like_cloudflare(snippet):
                 raise ChatGPTError(
                     "Cloudflare ne block kiya (challenge) — thodi der baad try karo, ya browser me "
@@ -182,20 +225,31 @@ class ChatGPTClient:
         raise ChatGPTError(f"{what} failed: HTTP {code} — {snippet[:200]}", status=502)
 
     # -- persona ------------------------------------------------------------
-    def detect_persona(self):
-        """Decide anonymous vs logged-in via /backend-api/me (cached)."""
-        if self._anon is not None:
-            return self._anon
+    def detect_persona(self, force=False):
+        """Decide anonymous vs logged-in via /backend-api/me (cached with TTL)."""
+        now = time.monotonic()
         with self._persona_lock:
-            if self._anon is not None:
-                return self._anon
+            if self._anon is not None and not force:
+                if now - self._persona_ts < self._persona_ttl:
+                    return self._anon
+        # singleflight: only one thread hits /me, the rest use the last value
+        with self._persona_lock:
+            if self._anon is not None and not force:
+                if time.monotonic() - self._persona_ts < self._persona_ttl:
+                    return self._anon
             try:
                 resp = self.session.get(BASE + "/backend-api/me", headers=self._headers())
                 data = resp.json() if resp.status_code == 200 else {}
                 uid = str(data.get("id") or "")
                 self._anon = uid.startswith("ua-")
+                self._persona_ts = time.monotonic()
             except Exception:
-                self._anon = False
+                # transport failure must not permanently flip routing:
+                # keep the previous value when we have one, else assume logged-in
+                if self._anon is None:
+                    self._anon = False
+                # short TTL so the next request retries detection soon
+                self._persona_ts = time.monotonic() - self._persona_ttl + 60.0
             return self._anon
 
     # -- models ---------------------------------------------------------------
@@ -204,33 +258,47 @@ class ChatGPTClient:
         with self._models_lock:
             if self._models and now - self._models_ts < refresh_sec:
                 return list(self._models)
-        resp = self.session.get(
-            BASE + "/backend-api/models",
-            params={"history_and_training_disabled": "false"},
-            headers=self._headers(),
-        )
-        if resp.status_code != 200 and self._anon:
+            if self._models_fetching:
+                # thundering herd: serve the last list instead of N parallel fetches
+                if self._models:
+                    return list(self._models)
+            else:
+                self._models_fetching = True
+        try:
             resp = self.session.get(
-                self.base + "/models",
+                BASE + "/backend-api/models",
                 params={"history_and_training_disabled": "false"},
                 headers=self._headers(),
             )
-        self._raise_for_status(resp, "GET models")
-        try:
-            data = resp.json()
-        except ValueError:
-            raise ChatGPTError("Models response JSON nahi hai — protocol badla hua lagta hai", status=502)
-        slugs = []
-        for m in data.get("models", []):
-            slug = m.get("slug")
-            if slug and slug not in slugs:
-                slugs.append(slug)
-        if not slugs:
-            raise ChatGPTError("Models list khali aayi — protocol badla hua lagta hai", status=502)
-        with self._models_lock:
-            self._models = slugs
-            self._models_ts = now
-        return list(slugs)
+            anon = self.detect_persona()
+            if resp.status_code != 200 and anon:
+                resp = self.session.get(
+                    self.base + "/models",
+                    params={"history_and_training_disabled": "false"},
+                    headers=self._headers(),
+                )
+            self._raise_for_status(resp, "GET models")
+            try:
+                data = resp.json()
+            except ValueError:
+                raise ChatGPTError("Models response JSON nahi hai — protocol badla hua lagta hai", status=502)
+            slugs = []
+            for m in data.get("models", []):
+                slug = m.get("slug")
+                if slug and slug not in slugs:
+                    slugs.append(slug)
+            if not slugs:
+                raise ChatGPTError("Models list khali aayi — protocol badla hua lagta hai", status=502)
+            with self._models_lock:
+                # first finisher wins; a stale slower response must not clobber
+                # a fresher list written while we were in flight
+                if now >= self._models_ts:
+                    self._models = slugs
+                    self._models_ts = now
+            return list(slugs)
+        finally:
+            with self._models_lock:
+                self._models_fetching = False
 
     def cached_models(self):
         return list(self._models)
@@ -240,17 +308,22 @@ class ChatGPTClient:
     def _backoff(self, attempt, exc):
         """Kind-aware retry delay in seconds for transient failures."""
         if isinstance(exc, RateLimitedError) and exc.retry_after:
-            return exc.retry_after + 0.1
+            try:
+                return min(self.max_retry_wait_sec, float(exc.retry_after) + 0.1)
+            except (TypeError, ValueError):
+                pass
         code = getattr(exc, "status", None)
         if code in RETRYABLE_STATUSES:
-            return self.retry_delay_sec * (2 ** attempt) + 0.1
-        return self.retry_delay_sec
+            base = self.retry_delay_sec * (2 ** attempt)
+            # full jitter: deterministic backoff retry-storms under load
+            base = base * (0.5 + random.random() * 0.5)
+            return min(self.max_retry_wait_sec, base + 0.1)
+        return min(self.max_retry_wait_sec, self.retry_delay_sec)
 
     def _sleep_before_retry(self, attempt, exc, deadline):
         """Bounded, deadline-aware backoff."""
-        max_wait = 8.0  # never sleep more than 8s inside a slot
         delay = self._backoff(attempt, exc)
-        delay = min(delay, max_wait)
+        delay = min(delay, self.max_retry_wait_sec)
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0.05:
@@ -273,8 +346,16 @@ class ChatGPTClient:
             if self._deadline is not None and self._deadline - time.monotonic() <= 0:
                 raise UpstreamTimeoutError(
                     "request deadline reached before chat-requirements")
+            # PoW gets at most ~4s or the remaining deadline, so a hard
+            # difficulty never pins the agent thread past the request budget
+            pow_deadline = None
+            if self._deadline is not None:
+                pow_deadline = min(self._deadline - 0.5,
+                                   time.monotonic() + 4.0)
+            else:
+                pow_deadline = time.monotonic() + 4.0
             config = self._sentinel.config(self.session)
-            body = {"p": requirements_token(list(config))}
+            body = {"p": requirements_token(list(config), deadline=pow_deadline)}
             try:
                 resp = self.session.post(self.base + "/sentinel/chat-requirements",
                                          json=body, headers=self._headers(with_body=True))
@@ -311,7 +392,9 @@ class ChatGPTClient:
             proof_token = ""
             pow_info = data.get("proofofwork") or {}
             if pow_info.get("required"):
-                proof_token, solved = answer_token(pow_info.get("seed", ""), pow_info.get("difficulty", "0fffff"), config)
+                proof_token, solved = answer_token(
+                    pow_info.get("seed", ""), pow_info.get("difficulty", "0fffff"),
+                    config, deadline=pow_deadline)
                 if not solved:
                     raise ChatGPTError(
                         "Proof-of-work solve nahi hua (difficulty bahut high) — thodi der baad try karo", status=502)
@@ -412,14 +495,18 @@ class ChatGPTClient:
         raise last_exc
 
     # -- SSE parsing -------------------------------------------------------------
-    @staticmethod
-    def iter_deltas(resp, state):
+    def iter_deltas(self, resp, state, first_byte_timeout=None, stream_read_timeout=None):
         """Parse the conversation SSE; yield assistant text deltas.
 
         `state` accumulates conversation_id / message_id / model_slug / usage /
         text / finished / moderated. Raises ChatGPTError on upstream error
-        events.
+        events, UpstreamTimeoutError when the first byte or the gap between
+        events exceeds the configured guards.
         """
+        if first_byte_timeout is None:
+            first_byte_timeout = self.first_byte_timeout_sec
+        if stream_read_timeout is None:
+            stream_read_timeout = self.stream_read_timeout_sec
         state.setdefault("conversation_id", None)
         state.setdefault("message_id", None)
         state.setdefault("model_slug", None)
@@ -430,7 +517,27 @@ class ChatGPTClient:
         state.setdefault("moderated", False)
         tail = deque(maxlen=40)
         saw_event = False
-        for raw in resp.iter_lines():
+        start = time.monotonic()
+        last_event = start
+        try:
+            lines = resp.iter_lines()
+        except Exception as exc:
+            raise ChatGPTError(f"ChatGPT stream open nahi hua: {exc}", status=502)
+        while True:
+            if first_byte_timeout and not saw_event:
+                if time.monotonic() - start > first_byte_timeout:
+                    raise UpstreamTimeoutError(
+                        "upstream first byte timeout (%.1fs)" % first_byte_timeout)
+            if stream_read_timeout and saw_event:
+                if time.monotonic() - last_event > stream_read_timeout:
+                    raise UpstreamTimeoutError(
+                        "upstream stream stalled (%.1fs silence)" % stream_read_timeout)
+            try:
+                raw = next(lines)
+            except StopIteration:
+                break
+            except Exception as exc:
+                raise ChatGPTError(f"ChatGPT stream toot gaya: {exc}", status=502)
             if not raw:
                 continue
             line = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
@@ -453,6 +560,7 @@ class ChatGPTClient:
             except ValueError:
                 continue
             saw_event = True
+            last_event = time.monotonic()
             delta = _event_delta(obj, state)
             if delta:
                 yield delta
@@ -490,10 +598,11 @@ def _event_delta(obj, state):
         raise ChatGPTError(f"ChatGPT error: {msg}", status=502)
 
     if obj.get("type") == "moderation":
-        state["moderated"] = True
         mod = obj.get("moderation_response") or {}
         if isinstance(mod, dict) and mod.get("blocked"):
+            state["moderated"] = True
             raise ChatGPTError("ChatGPT ne request block kar di (moderation)", status=400)
+        # not blocked: keep streaming, do NOT mark content_filter
         return ""
 
     delta = ""
@@ -508,7 +617,8 @@ def _event_delta(obj, state):
     conv = obj.get("conversation_id")
     if conv and not state.get("conversation_id"):
         state["conversation_id"] = conv
-    if obj.get("moderation_response"):
+    mod_resp = obj.get("moderation_response")
+    if isinstance(mod_resp, dict) and mod_resp.get("blocked"):
         state["moderated"] = True
     return delta
 

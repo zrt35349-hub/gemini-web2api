@@ -42,6 +42,24 @@ from .limiter import AdaptiveConcurrency
 
 _CREATED_TS = int(time.time())
 
+
+def _safe_msg(exc, limit=300):
+    """Truncate + scrub secrets from an error before sending it to the client."""
+    try:
+        msg = str(exc)
+    except Exception:
+        return "unknown error"
+    low = msg.lower()
+    # cookie/header material sometimes rides on transport exceptions
+    for token in ("cookie", "oai-did", "authorization", "bearer",
+                  "__secure", "oai-sc", "session-token"):
+        if token in low:
+            return "upstream request failed"
+    msg = " ".join(msg.split())
+    if len(msg) > limit:
+        msg = msg[:limit] + "..."
+    return msg or "unknown error"
+
 # Client names ChatGPT web does not know → nearest web equivalent.
 _MODEL_ALIASES = {
     "gpt-3.5-turbo": "auto",
@@ -168,13 +186,14 @@ class App:
             state["upstream_ok"] = True
             print("[OK] Cookie valid hai — models: " + ", ".join(slugs[:10])
                   + (" ..." if len(slugs) > 10 else ""), flush=True)
-        except ChatGPTError as exc:
+        except Exception as exc:  # transport/ValueError must not kill the daemon
             state["upstream_ok"] = False
             print("[FAIL] ChatGPT cookie check: %s" % exc, flush=True)
 
     def state_refresher(self):
         """Periodically re-fetches the sentinel build label so requests never
         pay the page-fetch round-trip and stay resilient to protocol drift.
+        Also hot-reloads a rotated cookie file without a restart.
         Runs until process exit; failures are quiet (stale state keeps working
         until upstream actually rejects it)."""
         interval = max(0, int(getattr(self.config, "state_refresh_sec", 300)))
@@ -184,6 +203,17 @@ class App:
             time.sleep(interval)
             try:
                 self.client._sentinel.refresh_build(self.client.session)
+            except Exception:
+                pass
+            try:
+                fresh = None
+                if hasattr(self.config, "resolve_cookie"):
+                    try:
+                        fresh = self.config.resolve_cookie()
+                    except Exception:
+                        fresh = None
+                if fresh and hasattr(self.client, "update_cookie"):
+                    self.client.update_cookie(fresh)
             except Exception:
                 pass
 
@@ -501,14 +531,30 @@ def make_handler(app):
                 total = 0
                 while True:
                     size_line = self.rfile.readline(65536).strip()
+                    if not size_line:
+                        break
                     try:
                         size = int(size_line.split(b";")[0] or b"0", 16)
                     except ValueError:
                         break
                     if size <= 0:
+                        # drain trailer + final CRLF without allocating
                         self.rfile.readline(65536)
                         break
-                    chunk = self.rfile.read(size)
+                    if size > limit:
+                        raise BodyTooLargeError()
+                    if total + size > limit:
+                        raise BodyTooLargeError()
+                    # cap a single read so a lying chunk-size can't OOM us
+                    remaining = size
+                    chunks = []
+                    while remaining > 0:
+                        piece = self.rfile.read(min(remaining, 65536))
+                        if not piece:
+                            break
+                        chunks.append(piece)
+                        remaining -= len(piece)
+                    chunk = b"".join(chunks)
                     parts.append(chunk)
                     total += len(chunk)
                     if total > limit:
@@ -518,7 +564,18 @@ def make_handler(app):
             length = int(self.headers.get("Content-Length") or 0)
             if length > limit:
                 raise BodyTooLargeError()
-            return self.rfile.read(length) if length > 0 else b""
+            if length <= 0:
+                return b""
+            # bounded reads so a huge Content-Length can't allocate at once
+            out = []
+            remaining = length
+            while remaining > 0:
+                piece = self.rfile.read(min(remaining, 65536))
+                if not piece:
+                    break
+                out.append(piece)
+                remaining -= len(piece)
+            return b"".join(out)
 
         def _api_key(self):
             auth = (self.headers.get("Authorization") or "").strip()
@@ -597,14 +654,30 @@ def make_handler(app):
 
         def _handle_health(self):
             cfg, client = app.config, app.client
+            try:
+                device = ((client.device_id or "")[:8] + "...") if client is not None else ""
+            except Exception:
+                device = ""
+            try:
+                models_cached = client.cached_models() if client is not None else []
+            except Exception:
+                models_cached = []
+            try:
+                cookie_path = cfg.cookie_path
+            except Exception:
+                cookie_path = ""
+            try:
+                port = int(getattr(cfg, "port", 0) or 0)
+            except Exception:
+                port = 0
             self._send_json({
                 "status": "ok",
                 "service": "chatgptwebapp2api",
                 "version": __version__,
-                "base_url": "http://localhost:%d/v1" % cfg.port,
-                "cookie_file": cfg.cookie_path,
-                "device_id": (client.device_id or "")[:8] + "...",
-                "models_cached": client.cached_models(),
+                "base_url": "http://localhost:%d/v1" % port,
+                "cookie_file": cookie_path,
+                "device_id": device,
+                "models_cached": models_cached,
                 "upstream_ok": state["upstream_ok"],
                 "load": app.load_snapshot(),
             })
@@ -648,24 +721,30 @@ def make_handler(app):
             runner = self._endpoint_runner(path, data)
             if runner is None:
                 return
+            if not isinstance(data, dict):
+                self._send_error_obj(400, "'messages' array required hai")
+                return
             started = time.monotonic()
             slot_held = False
             success = False
             pressure = None
             queue_wait_ms = 0.0
             try:
+                # never wait forever: legacy queue_wait_sec=0 still gets a
+                # 30s bound so a saturated gate can't pin the pool forever
                 wait_budget = app.queue_wait_sec
+                if wait_budget <= 0:
+                    wait_budget = 30.0
                 waited_at = time.monotonic()
-                if wait_budget > 0:
-                    acquired = app.limiter.acquire(timeout=wait_budget)
-                else:
-                    acquired = app.limiter.acquire()  # legacy: wait indefinitely
+                acquired = app.limiter.acquire(timeout=wait_budget)
                 queue_wait_ms = (time.monotonic() - waited_at) * 1000.0
                 if not acquired:
                     # fast, honest overload signal: a 429 + Retry-After beats
                     # parking the request behind a long queue (that queue wait
                     # is exactly what users see as huge latency)
-                    retry_after = max(1, int(min(10.0, max(wait_budget, 1.0))))
+                    snap = app.limiter.describe()
+                    depth = max(1, int(snap.get("waiting", 0)) + 1)
+                    retry_after = max(1, int(min(10.0, max(wait_budget / max(1, depth), 1.0))))
                     self._send_json(
                         {"error": {
                             "message": ("server busy: all upstream slots are in use, "
@@ -676,22 +755,40 @@ def make_handler(app):
                 slot_held = True
                 try:
                     lane_busy = False
+                    exec_budget = float(getattr(app.config, "request_deadline_sec", 0) or 0)
+                    if exec_budget <= 0:
+                        exec_budget = 75.0
+                    # leave headroom for the HTTP framing around the upstream call
+                    exec_budget = max(5.0, exec_budget + 10.0)
                     if app.agents is not None:
                         # execute the upstream part on a lane-bound agent:
                         # small chats never queue behind large-payload work
                         try:
                             app.agents.run(
                                 app.lane_for(data, len(raw)), runner, name=path,
-                                timeout=(app.agent_submit_wait_sec or None))
+                                timeout=(app.agent_submit_wait_sec or 5.0),
+                                exec_timeout=exec_budget)
                         except PoolBusy:
                             lane_busy = True
+                        except AgentError as exc:
+                            # exec budget hit (job did not finish in time)
+                            if "did not finish in time" in str(exc):
+                                raise UpstreamTimeoutError(
+                                    "agent execution timeout — upstream stalled")
+                            raise
                     else:
                         runner()
                     if lane_busy:
                         # lane queues saturated: same fast, honest overload signal
                         # as the admission gate (a 429 beats queueing silently)
+                        snap = app.agents.describe() if app.agents is not None else {}
+                        qd = 0
+                        try:
+                            qd = sum(l.get("queued", 0) for l in snap.get("lanes", {}).values())
+                        except Exception:
+                            qd = 0
                         retry_after = max(1, int(min(
-                            10.0, max(app.agent_submit_wait_sec, 1.0))))
+                            10.0, max(app.agent_submit_wait_sec, 1.0) + min(5, qd // 4))))
                         self._send_json(
                             {"error": {
                                 "message": ("server busy: the agent lanes are "
@@ -725,20 +822,24 @@ def make_handler(app):
                 self._fail(413, str(exc))
             except RateLimitedError as exc:
                 headers = {}
-                if getattr(exc, "retry_after", None):
-                    headers["Retry-After"] = str(max(1, int(float(exc.retry_after))))
+                try:
+                    if getattr(exc, "retry_after", None):
+                        headers["Retry-After"] = str(max(1, int(float(exc.retry_after))))
+                except (TypeError, ValueError):
+                    pass
                 self._fail(429, str(exc), "rate_limit_error", headers=headers)
             except UpstreamTimeoutError as exc:
                 self._fail(504, str(exc), "timeout_error",
                            headers={"Retry-After": "1"})
             except AgentError as exc:
                 # the fleet itself failed (agent died mid-job / pool stopped)
-                self._fail(502, "agent failure: %s" % exc, "upstream_error")
+                self._fail(502, "agent failure: %s" % _safe_msg(exc), "upstream_error")
             except ChatGPTError as exc:
                 # preserve the upstream status (413/401/403/...) for the client
                 self._fail(exc.status or 502, str(exc), "upstream_error")
             except Exception as exc:  # noqa: BLE001 - last-resort guard
-                self._fail(500, "internal error: %s" % exc, "internal_error")
+                # never leak cookie/header material that may ride on str(exc)
+                self._fail(500, "internal error: %s" % _safe_msg(exc), "internal_error")
             finally:
                 if slot_held:
                     if success:
@@ -801,15 +902,23 @@ def make_handler(app):
                 payload = obj
             else:
                 payload = json.dumps(obj, ensure_ascii=False)
-            with self._sse_lock:
-                self.wfile.write(b"data: " + payload.encode("utf-8") + b"\n\n")
-                self.wfile.flush()
+            try:
+                with self._sse_lock:
+                    self.wfile.write(b"data: " + payload.encode("utf-8") + b"\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                raise
+            except OSError as exc:
+                raise ConnectionResetError(str(exc))
 
         def _sse_stream_error(self, exc):
             """In-stream error for clients after headers/role chunk went out."""
-            self._sse({"error": {"message": str(exc), "type": "upstream_error",
-                                 "code": getattr(exc, "status", 502)}})
-            self._sse("[DONE]")
+            try:
+                self._sse({"error": {"message": _safe_msg(exc), "type": "upstream_error",
+                                     "code": getattr(exc, "status", 502)}})
+                self._sse("[DONE]")
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
 
         def _chunk(self, cid, created, slug, delta, finish=None):
             self._sse({
@@ -837,20 +946,26 @@ def make_handler(app):
                 if isinstance(usage, dict) and usage.get("total_tokens"):
                     self._sse({"id": cid, "object": "chat.completion.chunk", "created": created,
                                "model": model_seen, "choices": [], "usage": usage})
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                try:
+                    with self._sse_lock:
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
                 self._log("chat stream ok %ds model=%s chars=%d"
                           % (time.time() - t0, model_seen, len(stream_state.get("text", ""))))
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 self._log("chat stream: client disconnected")
-            except ChatGPTError as exc:
+            except (ChatGPTError, UpstreamTimeoutError) as exc:
                 # upstream failed after the stream opened — surface in-band
-                self._log("chat stream error %s: %s" % (exc.status, exc))
+                self._log("chat stream error %s: %s" % (getattr(exc, "status", 502), exc))
                 self._upstream_error = exc
-                try:
-                    self._sse_stream_error(exc)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+                self._sse_stream_error(exc)
+            except Exception as exc:  # transport/SSE bug mid-stream: never truncate silently
+                self._log("chat stream error 502: %s" % _safe_msg(exc))
+                self._upstream_error = ChatGPTError("upstream stream failed: %s" % _safe_msg(exc),
+                                                    status=502)
+                self._sse_stream_error(self._upstream_error)
 
         def _collect_openai(self, resp, slug, prompt_chars, t0):
             stream_state = {}

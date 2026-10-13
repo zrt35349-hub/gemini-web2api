@@ -251,9 +251,18 @@ def load_config(explicit: Optional[str] = None) -> Config:
     cfg = Config()
     path = find_config(explicit)
     if path and os.path.isfile(path):
-        with open(path, "r", encoding="utf-8-sig") as fh:
-            _apply(cfg, json.load(fh))
-        cfg.config_path = path
+        try:
+            with open(path, "r", encoding="utf-8-sig") as fh:
+                _apply(cfg, json.load(fh))
+        except (ValueError, OSError) as exc:
+            print("[WARN] config file %s unreadable (%s) — defaults + env win" % (path, exc),
+                  flush=True)
+            cfg.config_path = None
+        else:
+            try:
+                cfg.config_path = path
+            except Exception:
+                pass
     env = dict(os.environ)
     env.update(load_env_file(".env"))
     _apply_env_overrides(cfg, env)
@@ -302,13 +311,16 @@ class CookieStore:
     """Reads a cookie file (plain Cookie-header string or JSON {cookie, sapisid}).
 
     The file is re-read whenever its mtime changes, so swapping cookies does not
-    require a server restart.
+    require a server restart. Reads are atomic (truncated mid-write files keep
+    serving the last good jar) and guarded by a lock.
     """
 
     SAPISID_RE = re.compile(r"SAPISID=([^;\s]+)")
 
     def __init__(self, path: str):
+        import threading as _th
         self.path = path
+        self._lock = _th.Lock()
         self._mtime = None
         self._cookie = ""
         self._sapisid = ""
@@ -318,14 +330,36 @@ class CookieStore:
         try:
             mtime = os.path.getmtime(self.path)
         except OSError:
-            return "", ""
-        if self._mtime is None or mtime != self._mtime:
+            with self._lock:
+                return self._cookie, self._sapisid
+        with self._lock:
+            if self._mtime is not None and mtime == self._mtime:
+                return self._cookie, self._sapisid
+            cookie, sapisid = self._cookie, self._sapisid
             try:
-                self._load()
+                with open(self.path, "r", encoding="utf-8") as fh:
+                    raw = fh.read().strip()
             except OSError:
-                return "", ""
-            self._mtime = mtime
-        return self._cookie, self._sapisid
+                return cookie, sapisid
+            if not raw:
+                return cookie, sapisid
+            parsed_cookie, parsed_sapisid = raw, ""
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    parsed_cookie = str(data.get("cookie", "")).strip()
+                    parsed_sapisid = str(data.get("sapisid", "")).strip()
+            except ValueError:
+                pass
+            if parsed_cookie and not parsed_sapisid:
+                m = self.SAPISID_RE.search(parsed_cookie)
+                if m:
+                    parsed_sapisid = m.group(1).strip()
+            # truncated mid-write (no SAPISID, tiny file): keep last good jar
+            if parsed_cookie and len(parsed_cookie) >= 16:
+                self._cookie, self._sapisid = parsed_cookie, parsed_sapisid
+                self._mtime = mtime
+            return self._cookie, self._sapisid
 
     def _load(self):
         with open(self.path, "r", encoding="utf-8") as fh:

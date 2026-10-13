@@ -374,6 +374,7 @@ class GeminiClient:
             self.cookies = None
         self._http_client = None
         self._curl_client = None
+        self._client_lock = threading.Lock()
         self._bl_lock = threading.Lock()
         self._xsrf_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -392,10 +393,12 @@ class GeminiClient:
         while an impersonated Chrome fingerprint passes. None if not installed.
         """
         if self._curl_client is None and HAVE_CURL_CFFI:
-            kwargs = {"timeout": self.cfg.request_timeout_sec}
-            if self.cfg.proxy:
-                kwargs["proxies"] = {"http": self.cfg.proxy, "https": self.cfg.proxy}
-            self._curl_client = CurlSession(impersonate="chrome", **kwargs)
+            with self._client_lock:
+                if self._curl_client is None and HAVE_CURL_CFFI:
+                    kwargs = {"timeout": self.cfg.request_timeout_sec}
+                    if self.cfg.proxy:
+                        kwargs["proxies"] = {"http": self.cfg.proxy, "https": self.cfg.proxy}
+                    self._curl_client = CurlSession(impersonate="chrome", **kwargs)
         return self._curl_client
 
     def _use_curl_for_files(self, file_refs):
@@ -411,33 +414,35 @@ class GeminiClient:
         a saturated pool fails in seconds instead of hanging a worker.
         """
         if self._http_client is None and HAVE_HTTPX:
-            timeout = httpx.Timeout(
-                connect=min(10.0, float(self.cfg.request_timeout_sec)),
-                read=float(self.cfg.request_timeout_sec),
-                write=30.0,
-                pool=10.0,
-            )
-            common = dict(
-                timeout=timeout,
-                follow_redirects=True,
-                http2=HAVE_H2,
-                limits=httpx.Limits(
-                    max_connections=max(
-                        HTTP_MAX_CONNECTIONS,
-                        int(getattr(self.cfg, "max_concurrent_requests", 8) or 8) * 2),
-                    max_keepalive_connections=max(
-                        HTTP_MAX_KEEPALIVE,
-                        int(getattr(self.cfg, "max_concurrent_requests", 8) or 8)),
-                    keepalive_expiry=KEEPALIVE_EXPIRY_SEC),
-                headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
-            )
-            if self.cfg.proxy:
-                try:
-                    self._http_client = httpx.Client(proxy=self.cfg.proxy, **common)
-                except TypeError:  # httpx < 0.26
-                    self._http_client = httpx.Client(proxies=self.cfg.proxy, **common)
-            else:
-                self._http_client = httpx.Client(**common)
+            with self._client_lock:
+                if self._http_client is None and HAVE_HTTPX:
+                    timeout = httpx.Timeout(
+                        connect=min(10.0, float(self.cfg.request_timeout_sec)),
+                        read=float(self.cfg.request_timeout_sec),
+                        write=30.0,
+                        pool=10.0,
+                    )
+                    common = dict(
+                        timeout=timeout,
+                        follow_redirects=True,
+                        http2=HAVE_H2,
+                        limits=httpx.Limits(
+                            max_connections=max(
+                                HTTP_MAX_CONNECTIONS,
+                                int(getattr(self.cfg, "max_concurrent_requests", 8) or 8) * 2),
+                            max_keepalive_connections=max(
+                                HTTP_MAX_KEEPALIVE,
+                                int(getattr(self.cfg, "max_concurrent_requests", 8) or 8)),
+                            keepalive_expiry=KEEPALIVE_EXPIRY_SEC),
+                        headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
+                    )
+                    if self.cfg.proxy:
+                        try:
+                            self._http_client = httpx.Client(proxy=self.cfg.proxy, **common)
+                        except TypeError:  # httpx < 0.26
+                            self._http_client = httpx.Client(proxies=self.cfg.proxy, **common)
+                    else:
+                        self._http_client = httpx.Client(**common)
         return self._http_client
 
     def _urllib_request(self, method, url, body=None, headers=None):
@@ -473,12 +478,19 @@ class GeminiClient:
 
     def fetch_page(self, path="/app"):
         url = f"{GEMINI_BASE}{self._prefix()}{path}"
-        http = self._http()
-        if http is not None:
-            resp = http.get(url, headers=self._common_headers())
-            resp.raise_for_status()
-            return resp.text
-        return self._urllib_request("GET", url)
+        try:
+            http = self._http()
+            if http is not None:
+                resp = http.get(url, headers=self._common_headers())
+                resp.raise_for_status()
+                return resp.text
+            return self._urllib_request("GET", url)
+        except GeminiError:
+            raise
+        except Exception as exc:
+            # warmup/refresh callers only catch GeminiError: never leak a raw
+            # httpx/URLError that would silently kill the background thread
+            raise transport_error(exc, phase="fetch %s" % path)
 
     def refresh_state(self):
         """One /app fetch refreshes the build label AND the xsrf token.
@@ -509,9 +521,17 @@ class GeminiClient:
     def ensure_bl(self):
         if self.cfg.gemini_bl:
             return self.cfg.gemini_bl
-        with self._bl_lock:
+        # singleflight with refresh_state: both guard on _state_lock so two
+        # threads never fire duplicate /app fetches at startup
+        with self._state_lock:
             if not self.cfg.gemini_bl:
-                self.refresh_state()
+                html = self.fetch_page("/app")
+                label = extract_build_label(html)
+                if not label:
+                    raise GeminiError(
+                        "Could not extract build label (cfb2h / boq_*) from "
+                        "gemini.google.com/app — page layout may have changed.")
+                self.cfg.gemini_bl = label
             return self.cfg.gemini_bl
 
     def get_xsrf(self, force=False):

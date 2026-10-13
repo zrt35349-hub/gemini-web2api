@@ -57,6 +57,11 @@ class AdaptiveConcurrency:
         self._successes = 0
         self._cooldown_until = 0.0
         self._last_pressure = ""
+        # circuit breaker: N consecutive rate_limit hits open the gate briefly
+        # so a quota storm sheds fast instead of burning every slot on 429s
+        self._consec_rate_limit = 0
+        self._open_until = 0.0
+        self.circuit_opens = 0
         self.latency_target_sec = float(latency_target_sec or 0.0)
         # observability (read without the lock is fine for counters)
         self.acquired = 0
@@ -81,11 +86,22 @@ class AdaptiveConcurrency:
         else:
             deadline = None
         with self._cond:
+            # open circuit: fail fast without queueing behind a known 429 storm
+            if self._open_until and time.monotonic() < self._open_until:
+                if count_shed:
+                    self.shed += 1
+                return False
             self._waiting += 1
             try:
                 while self._in_flight >= self._limit:
                     if deadline is None:
-                        self._cond.wait()
+                        self._cond.wait(timeout=1.0)
+                        # re-check the breaker on every wakeup (None = legacy
+                        # unbounded wait, but still shed when the circuit opens)
+                        if self._open_until and time.monotonic() < self._open_until:
+                            if count_shed:
+                                self.shed += 1
+                            return False
                         continue
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -115,6 +131,7 @@ class AdaptiveConcurrency:
                 pass
             elif success and not pressure:
                 self.completed += 1
+                self._consec_rate_limit = 0
                 self._on_success()
             else:
                 self.failed += 1
@@ -126,13 +143,28 @@ class AdaptiveConcurrency:
     def _on_pressure(self, kind):
         self._successes = 0
         self._last_pressure = kind
+        if kind == "rate_limit":
+            self._consec_rate_limit += 1
+        else:
+            self._consec_rate_limit = 0
+        # 4 straight 429s -> open the circuit for 5s: shed fast, let quota recover
+        if self._consec_rate_limit >= 4:
+            now = time.monotonic()
+            if now >= self._open_until:
+                self.circuit_opens += 1
+            self._open_until = now + 5.0
+            self._consec_rate_limit = 0
         if not self._adaptive:
             return
         now = time.monotonic()
         if now < self._cooldown_until:
             return  # already backing off for this wave; don't shrink per error
         factor = self.PRESSURE_FACTORS.get(kind, 0.75)
-        target = max(self._minimum, int(self._limit * factor))
+        # sustained 429s cut deeper than a single wave: drop to floor fast
+        if kind == "rate_limit" and self.failed >= 3:
+            target = self._minimum
+        else:
+            target = max(self._minimum, int(self._limit * factor))
         if target < self._limit:
             self._limit = target
             self.decreases += 1
@@ -163,6 +195,8 @@ class AdaptiveConcurrency:
     def describe(self):
         with self._cond:
             limit, in_flight, waiting = self._limit, self._in_flight, self._waiting
+            open_circuit = self._open_until > time.monotonic()
+            opens = self.circuit_opens
         return {
             "limit": limit,
             "in_flight": in_flight,
@@ -179,6 +213,8 @@ class AdaptiveConcurrency:
             "decreases": self.decreases,
             "peak_limit": self.peak_limit,
             "last_pressure": self._last_pressure,
+            "circuit_open": open_circuit,
+            "circuit_opens": opens,
         }
 
     @property

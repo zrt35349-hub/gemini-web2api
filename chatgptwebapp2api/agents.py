@@ -122,6 +122,7 @@ class Agent:
         self.thread = None
         self.current_job = None   # job being executed right now
         self.orphan_job = None    # job left behind by an agent-level crash
+        self._job_started_at = None  # monotonic ts of the current job (stuck watchdog)
         self.revives = 0
         self.revive_at = 0.0
         self.completed = 0
@@ -147,17 +148,27 @@ class Agent:
             if job is None:
                 continue
             self.current_job = job
+            self._job_started_at = time.monotonic()
             try:
                 self._execute(job)
-            except BaseException:  # noqa: BLE001 - agent-level crash
+            except Exception:  # noqa: BLE001 - agent-level crash
                 # A crash here means a bug in the fleet itself, not a request
                 # failure: park the job for the supervisor, end the thread and
                 # let the supervisor fail the job + revive this agent.
-                self.orphan_job = None if job.done else job
+                # (BaseException like KeyboardInterrupt must propagate, never
+                # be swallowed into a job failure.)
+                try:
+                    if not job.done:
+                        self.orphan_job = job
+                    else:
+                        self.orphan_job = None
+                except Exception:
+                    self.orphan_job = None
                 self.last_error = f"agent {self.name} crashed"
                 return
             finally:
                 self.current_job = None
+                self._job_started_at = None
 
     def _execute(self, job):
         """Runs one job; request errors are captured in the job, never raised."""
@@ -165,7 +176,7 @@ class Agent:
         started = job.started_at
         try:
             result = job.fn()
-        except BaseException as exc:  # noqa: BLE001 - re-raised in the waiter
+        except Exception as exc:  # noqa: BLE001 - re-raised in the waiter
             job._fail(exc)
             self.failed += 1
         else:
@@ -227,13 +238,18 @@ class AgentPool:
             threads = [agent.thread for agent in self.agents if agent.thread is not None]
             if self._supervisor is not None:
                 threads.append(self._supervisor)
-            for thread in threads:
-                if thread is threading.current_thread():
-                    continue
-                try:
-                    thread.join(timeout=timeout)
-                except RuntimeError:  # revived in the publish window; daemon anyway
-                    pass
+        # join outside _life_lock with a shared budget (32 agents x 2s = 64s
+        # sequential was a shutdown hang; now the whole fleet gets ~timeout)
+        deadline = time.monotonic() + max(0.5, float(timeout or 2.0))
+        for thread in threads:
+            if thread is threading.current_thread():
+                continue
+            remaining = max(0.05, deadline - time.monotonic())
+            try:
+                thread.join(timeout=remaining)
+            except RuntimeError:  # revived in the publish window; daemon anyway
+                pass
+        with self._life_lock:
             self._supervisor = None
 
     @property
@@ -271,10 +287,15 @@ class AgentPool:
             self._cond.notify_all()
         return job
 
-    def run(self, lane, fn, name="", timeout=None):
-        """Submits ``fn`` and waits for it, re-raising whatever it raised."""
+    def run(self, lane, fn, name="", timeout=None, exec_timeout=None):
+        """Submits ``fn`` and waits for it, re-raising whatever it raised.
+
+        ``timeout`` bounds the queue-slot wait; ``exec_timeout`` bounds the
+        execution wait (None = wait for the job; prefer a request-deadline
+        here so a stalled upstream never pins the HTTP worker forever).
+        """
         job = self.submit(lane, fn, name=name, timeout=timeout)
-        return job.result_or_raise()
+        return job.result_or_raise(timeout=exec_timeout)
 
     def _take(self, agent):
         """Blocks until a job is available for this agent; None when stopping."""
@@ -335,18 +356,25 @@ class AgentPool:
     def describe(self):
         """Live fleet state for /health: per-lane agents, queues and timings."""
         lanes = {}
+        # snapshot counters under the queue lock so /health never reports
+        # torn busy/completed numbers while workers mutate them
+        with self._cond:
+            queued_snap = {lane: len(self._queues[lane]) for lane in LANES}
         for lane in LANES:
             members = [a for a in self.agents if a.lane == lane]
-            busy = sum(1 for a in members if a.current_job is not None)
-            completed = sum(a.completed for a in members)
-            failed = sum(a.failed for a in members)
-            total_ms = sum(a.total_ms for a in members)
-            with self._cond:
-                queued = len(self._queues[lane])
+            # current_job is set/cleared by the agent thread; read it
+            # defensively (a torn read only skews one /health poll)
+            try:
+                busy = sum(1 for a in members if a.current_job is not None)
+                completed = sum(a.completed for a in members)
+                failed = sum(a.failed for a in members)
+                total_ms = sum(a.total_ms for a in members)
+            except Exception:
+                busy, completed, failed, total_ms = 0, 0, 0, 0.0
             lanes[lane] = {
                 "agents": len(members),
                 "busy": busy,
-                "queued": queued,
+                "queued": queued_snap.get(lane, 0),
                 "queue_depth": self.queue_depth,
                 "completed": completed,
                 "failed": failed,

@@ -73,7 +73,7 @@ def _parse_time():
     return now.strftime("%a %b %d %Y %H:%M:%S") + " GMT-0500 (Eastern Standard Time)"
 
 
-def generate_answer(seed, diff, config):
+def generate_answer(seed, diff, config, deadline=None, max_iters=500000):
     """SHA3-512 prefix search; returns (base64_config, solved_bool)."""
     diff_len = len(diff)
     seed_bytes = seed.encode()
@@ -81,7 +81,9 @@ def generate_answer(seed, diff, config):
         target = bytes.fromhex(diff)
     except ValueError:
         target = b"\xff" * max(1, diff_len // 2)
-    for i in range(500000):
+    for i in range(max_iters):
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         config[3] = i
         config[9] = i >> 1
         blob = json.dumps(config, separators=(",", ":"), ensure_ascii=False).encode()
@@ -92,15 +94,16 @@ def generate_answer(seed, diff, config):
             + base64.b64encode(f'"{seed}"'.encode()).decode()), False
 
 
-def requirements_token(config):
+def requirements_token(config, deadline=None):
     """Pre-challenge token sent in the chat-requirements body."""
-    answer, _ = generate_answer(format(random.random()), "0fffff", config)
+    answer, _ = generate_answer(format(random.random()), "0fffff", config,
+                                deadline=deadline)
     return "gAAAAAC" + answer
 
 
-def answer_token(seed, diff, config):
+def answer_token(seed, diff, config, deadline=None):
     """Proof-of-work token for the conversation request."""
-    answer, solved = generate_answer(seed, diff, config)
+    answer, solved = generate_answer(seed, diff, config, deadline=deadline)
     return "gAAAAAB" + answer, solved
 
 
@@ -121,69 +124,80 @@ class Sentinel:
         self._config_ts = 0.0
         self._lock = threading.RLock()  # reentrant: config() holds it across refresh_build()
 
-    def refresh_build(self, session):
+    def refresh_build(self, session, timeout=10):
+        # fast path under lock; network I/O happens outside the lock so
+        # concurrent chat-requirements never serialize on a slow page fetch
         with self._lock:
             if time.time() - self._dpl_ts < 900:
                 return
-            try:
-                r = session.get(_HOME + "/", headers={
-                    "Accept": "text/html,application/xhtml+xml",
-                    "User-Agent": self.user_agent,
-                })
-                html = r.text or ""
-            except Exception:
-                html = ""
-            try:
-                r = session.get(_HOME + "/", headers={
-                    "Accept": "text/html,application/xhtml+xml",
-                    "User-Agent": self.user_agent,
-                })
-                html = r.text or ""
-            except Exception:
-                html = ""
-            scripts = re.findall(r'<script[^>]+src="([^"]+)"', html)
-            if scripts:
-                self._scripts = scripts
-            dpl = ""
-            m = re.search(r'data-build="([^"]+)"', html)
+        try:
+            r = session.get(_HOME + "/", headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "User-Agent": self.user_agent,
+            }, timeout=timeout)
+            html = r.text or "" if getattr(r, "status_code", 200) == 200 else ""
+        except Exception:
+            html = ""
+        if not html or "<script" not in html or "just a moment" in html.lower():
+            # Cloudflare challenge / empty page: keep the last good label,
+            # but bump the timestamp a little so we don't hammer it
+            with self._lock:
+                self._dpl_ts = time.time() - 600
+            return
+        scripts = re.findall(r'<script[^>]+src="([^"]+)"', html)
+        dpl = ""
+        m = re.search(r'data-build="([^"]+)"', html)
+        if m:
+            dpl = m.group(1)
+        if not dpl:
+            m = re.search(r'dpl=([0-9a-f]{16,})', html)
+            if m:
+                dpl = "prod-" + m.group(1)
+        if not dpl:
+            m = re.search(r'/_next/static/([^/]+)/_', html)
             if m:
                 dpl = m.group(1)
-            if not dpl:
-                m = re.search(r'dpl=([0-9a-f]{16,})', html)
-                if m:
-                    dpl = "prod-" + m.group(1)
-            if not dpl:
-                m = re.search(r'/_next/static/([^/]+)/_', html)
-                if m:
-                    dpl = m.group(1)
-            self._dpl = dpl
+        with self._lock:
+            if scripts:
+                self._scripts = scripts
+            # empty dpl (layout drift) must not wipe a working label
+            if dpl:
+                self._dpl = dpl
             self._dpl_ts = time.time()
 
     def config(self, session, max_age=3600):
+        now = time.time()
         with self._lock:
-            now = time.time()
-            if self._config is None or now - self._config_ts > max_age:
-                self.refresh_build(session)
-                perf = time.perf_counter() * 1000
-                self._config = [
-                    random.choice([3000, 4000, 3120, 4160]),
-                    _parse_time(),
-                    4294705152,
-                    0,
-                    self.user_agent,
-                    random.choice(self._scripts) if self._scripts else _FALLBACK_SCRIPT,
-                    self._dpl,
-                    "en-US",
-                    "en-US,es-US,en,es",
-                    0,
-                    random.choice(_NAV_KEYS),
-                    random.choice(_DOC_KEYS),
-                    random.choice(_WIN_KEYS),
-                    perf,
-                    str(uuid.uuid4()),
-                    "",
-                    random.choice([8, 16, 24, 32]),
-                    time.time() * 1000 - perf,
-                ]
-                self._config_ts = now
+            cached = list(self._config) if self._config is not None else None
+            fresh = cached is not None and now - self._config_ts <= max_age
+            scripts = list(self._scripts) if self._scripts else [_FALLBACK_SCRIPT]
+            dpl = self._dpl
+        if fresh:
+            return list(cached)
+        self.refresh_build(session)
+        with self._lock:
+            scripts = list(self._scripts) if self._scripts else [_FALLBACK_SCRIPT]
+            dpl = self._dpl
+            perf = time.perf_counter() * 1000
+            self._config = [
+                random.choice([3000, 4000, 3120, 4160]),
+                _parse_time(),
+                4294705152,
+                0,
+                self.user_agent,
+                random.choice(scripts) if scripts else _FALLBACK_SCRIPT,
+                dpl,
+                "en-US",
+                "en-US,es-US,en,es",
+                0,
+                random.choice(_NAV_KEYS),
+                random.choice(_DOC_KEYS),
+                random.choice(_WIN_KEYS),
+                perf,
+                str(uuid.uuid4()),
+                "",
+                random.choice([8, 16, 24, 32]),
+                time.time() * 1000 - perf,
+            ]
+            self._config_ts = time.time()
             return list(self._config)

@@ -15,7 +15,8 @@ import argparse
 import json
 import os
 import re
-from dataclasses import dataclass, fields
+import threading
+from dataclasses import dataclass, field, fields
 from typing import List, Optional
 
 ENV_CONFIG_VAR = "CHATGPT_WEB2API_CONFIG"
@@ -88,6 +89,12 @@ class Config:
     # cookie / proxy
     proxy: Optional[str] = None
 
+    # per-instance cookie cache (never share mtime across Config objects)
+    _cookie_mtime: Optional[float] = field(default=None, repr=False, compare=False)
+    _cached_cookie: Optional[str] = field(default=None, repr=False, compare=False)
+    _cookie_lock: threading.Lock = field(default_factory=threading.Lock,
+                                         repr=False, compare=False)
+
     def __post_init__(self):
         if self.api_keys is None:
             self.api_keys = []
@@ -124,6 +131,9 @@ class Config:
     def load_cookie(self):
         """Read the cookie jar; beginner-proof against BOM / 'Cookie:' prefix /
         multi-line pastes. Raises FileNotFoundError if no cookie config exists."""
+        # env cookie always wins and never touches the file cache
+        if self.cookie_string:
+            return self.cookie_string
         path = self.cookie_file
         if not path:
             raise FileNotFoundError("cookie_file not configured")
@@ -136,34 +146,39 @@ class Config:
                     break
             else:
                 raise FileNotFoundError(f"cookie file not found: {path}")
-        # --- read with mtime caching for hot-reload ---
-        self._read_cookie_cached(path)
-        return self._cached_cookie
-
-    _cookie_mtime = None
-    _cached_cookie = None
+        # --- read with mtime caching for hot-reload (thread-safe, per-instance) ---
+        return self._read_cookie_cached(path)
 
     def _read_cookie_cached(self, path):
         try:
             mtime = os.path.getmtime(path)
         except OSError:
-            return
-        if self._cookie_mtime == mtime and self._cached_cookie is not None:
-            return
-        with open(path, "r", encoding="utf-8-sig") as fh:
-            raw = fh.read()
-        raw = raw.strip()
-        if "\n" in raw or "\r" in raw:
-            lines = [ln.strip().rstrip(";") for ln in raw.splitlines()
-                     if ln.strip() and not ln.strip().startswith("#")]
-            if lines and all("=" in ln for ln in lines):
-                raw = "; ".join(lines)
-            else:
-                raw = " ".join(raw.split())
-        if raw.lower().startswith("cookie:"):
-            raw = raw[7:].strip()
-        self._cached_cookie = raw.strip()
-        self._cookie_mtime = mtime
+            # file vanished: keep serving the last good cookie instead of
+            # sending "Cookie: None" upstream (which always 401s)
+            return self._cached_cookie
+        with self._cookie_lock:
+            if self._cookie_mtime == mtime and self._cached_cookie is not None:
+                return self._cached_cookie
+            try:
+                with open(path, "r", encoding="utf-8-sig") as fh:
+                    raw = fh.read()
+            except OSError:
+                return self._cached_cookie
+            raw = raw.strip()
+            if "\n" in raw or "\r" in raw:
+                lines = [ln.strip().rstrip(";") for ln in raw.splitlines()
+                         if ln.strip() and not ln.strip().startswith("#")]
+                if lines and all("=" in ln for ln in lines):
+                    raw = "; ".join(lines)
+                else:
+                    raw = " ".join(raw.split())
+            if raw.lower().startswith("cookie:"):
+                raw = raw[7:].strip()
+            raw = raw.strip()
+            if raw:
+                self._cached_cookie = raw
+                self._cookie_mtime = mtime
+            return self._cached_cookie
 
     @property
     def cookie_path(self):
@@ -333,9 +348,15 @@ def load_config(explicit: Optional[str] = None) -> Config:
     cfg = Config()
     path = find_config(explicit)
     if path and os.path.isfile(path):
-        with open(path, "r", encoding="utf-8-sig") as fh:
-            _apply(cfg, json.load(fh))
-        cfg.config_path = path
+        try:
+            with open(path, "r", encoding="utf-8-sig") as fh:
+                _apply(cfg, json.load(fh))
+        except (ValueError, OSError) as exc:
+            print("[WARN] config file %s unreadable (%s) — defaults + env win" % (path, exc),
+                  flush=True)
+            cfg.config_path = None
+        else:
+            cfg.config_path = path
     env = dict(os.environ)
     env.update(load_env_file(".env"))
     _apply_env_overrides(cfg, env)
@@ -352,6 +373,7 @@ def parse_args(argv=None):
     parser.add_argument("--config", help="path to config.json")
     parser.add_argument("--cookie-file", help="path to cookie file (header string or JSON)")
     parser.add_argument("--proxy", help="upstream proxy URL, e.g. http://127.0.0.1:7890")
+    parser.add_argument("--version", action="store_true", help="print version and exit")
     return parser.parse_args(argv)
 
 

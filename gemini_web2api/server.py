@@ -172,7 +172,7 @@ class App:
         """
         try:
             self.gemini.refresh_state()
-        except GeminiError as exc:
+        except Exception as exc:  # transport/ValueError must not kill the daemon
             self._warn(f"state prefetch failed: {exc}")
 
     def state_refresher(self):
