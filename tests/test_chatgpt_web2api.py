@@ -109,10 +109,11 @@ class CompactionRetryTests(unittest.TestCase):
         ]
         retry_logs = []
 
-        prompt, response = start_conversation_with_compaction(
+        prompt, response, compacted = start_conversation_with_compaction(
             client, messages, "gpt-6", history_disabled=True, on_retry=retry_logs.append)
 
         self.assertEqual(response, "response")
+        self.assertTrue(compacted)
         self.assertGreater(len(client.prompts), 1)
         self.assertIn("Initial project requirements.", prompt)
         self.assertIn("Latest project changes.", prompt)

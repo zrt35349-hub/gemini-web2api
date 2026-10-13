@@ -194,6 +194,13 @@ class App:
         except Exception as exc:  # transport/ValueError must not kill the daemon
             state["upstream_ok"] = False
             print("[FAIL] ChatGPT cookie check: %s" % exc, flush=True)
+        try:
+            # Pre-resolve the sentinel build label so the first real chat
+            # skips the homepage fetch (one upstream RTT saved on cold start).
+            if self.client is not None:
+                self.client._sentinel.config(self.client.session)
+        except Exception:
+            pass
 
     def state_refresher(self):
         """Periodically re-fetches the sentinel build label so requests never
@@ -411,7 +418,12 @@ def start_conversation_with_compaction(client, messages, model, history_disabled
     """Retry a rejected oversized prompt with progressively smaller history.
 
     ``deadline_sec`` (optional) bounds the total upstream cost of each attempt.
+
+    Returns (prompt, response, compacted) — ``compacted`` tells the caller
+    whether history was dropped, so it never has to re-render the full
+    prompt just to detect that.
     """
+    compacted = False
     for index, budget in enumerate(_PROMPT_BUDGETS_BYTES):
         prompt = messages_to_prompt(messages, max_bytes=budget)
         if on_attempt:
@@ -422,10 +434,11 @@ def start_conversation_with_compaction(client, messages, model, history_disabled
                 kwargs["deadline_sec"] = deadline_sec
             response = client.start_conversation(
                 prompt, model, history_disabled=history_disabled, **kwargs)
-            return prompt, response
+            return prompt, response, compacted
         except ChatGPTError as exc:
             if exc.status != 413 or index == len(_PROMPT_BUDGETS_BYTES) - 1:
                 raise
+            compacted = True
             if on_retry:
                 on_retry("upstream rejected prompt with HTTP 413; retrying with a %d-byte limit"
                          % _PROMPT_BUDGETS_BYTES[index + 1])
@@ -929,8 +942,13 @@ def make_handler(app):
             available = client.cached_models() or _FALLBACK_MODELS
             slug = resolve_model(data.get("model"), available, cfg.default_model)
             t0 = time.time()
+            if data.get("stream"):
+                # instant TTFB path: headers + role chunk flush in ~ms,
+                # upstream conversation starts afterwards
+                self._chat_stream(data, cfg, client, messages, slug, t0)
+                return
             try:
-                prompt, resp = start_conversation_with_compaction(
+                prompt, resp, compacted = start_conversation_with_compaction(
                     client, messages, slug, history_disabled=cfg.temporary_chats,
                     deadline_sec=getattr(cfg, "request_deadline_sec", 0) or 0,
                     on_retry=self._log,
@@ -941,15 +959,59 @@ def make_handler(app):
                 raise
             except ChatGPTError:
                 raise
-            if _serialized_prompt_size(prompt) < _serialized_prompt_size(
-                    messages_to_prompt(messages)):
+            if compacted:
                 self._log("chat history compacted to fit upstream request limit")
 
             first_to, read_to = self._stream_timeouts(len(prompt))
-            if data.get("stream"):
-                self._stream_openai(resp, slug, t0, first_to, read_to)
-            else:
-                self._collect_openai(resp, slug, len(prompt), t0, first_to, read_to)
+            self._collect_openai(resp, slug, len(prompt), t0, first_to, read_to)
+
+        def _chat_stream(self, data, cfg, client, messages, slug, t0):
+            """Streaming chat with instant TTFB.
+
+            SSE headers + the role chunk flush in ~milliseconds, *before*
+            the upstream conversation is even started. Deltas then forward
+            as they arrive. Any upstream failure (auth/429/413/timeout)
+            surfaces as an in-band SSE error event + [DONE], never a hang.
+            """
+            cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+            created = int(time.time())
+            self._start_stream("text/event-stream; charset=utf-8")
+            try:
+                self._chunk(cid, created, slug, {"role": "assistant", "content": ""})
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self._log("chat stream: client disconnected")
+                return
+            try:
+                prompt, resp, compacted = start_conversation_with_compaction(
+                    client, messages, slug, history_disabled=cfg.temporary_chats,
+                    deadline_sec=getattr(cfg, "request_deadline_sec", 0) or 0,
+                    on_retry=self._log,
+                    on_attempt=lambda value: self._log(
+                        "chat start: model=%s stream=%s chars=%d"
+                        % (slug, bool(data.get("stream")), len(value))))
+                if compacted:
+                    self._log("chat history compacted to fit upstream request limit")
+                first_to, read_to = self._stream_timeouts(len(prompt))
+                self._pump_stream(resp, slug, cid=cid, created=created, t0=t0,
+                                  first_byte_timeout=first_to,
+                                  stream_read_timeout=read_to)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self._log("chat stream: client disconnected")
+            except PromptTooLong as exc:
+                err = ChatGPTError(str(exc), status=413)
+                self._log("chat stream error 413: %s" % _safe_msg(exc))
+                self._upstream_error = err
+                self._sse_stream_error(err)
+            except (ChatGPTError, UpstreamTimeoutError) as exc:
+                # upstream failed before/during the stream — surface in-band
+                self._log("chat stream error %s: %s" % (getattr(exc, "status", 502), exc))
+                self._upstream_error = exc
+                self._sse_stream_error(exc)
+            except Exception as exc:  # never truncate silently after headers went out
+                self._log("chat stream error 502: %s" % _safe_msg(exc))
+                self._upstream_error = ChatGPTError("upstream stream failed: %s" % _safe_msg(exc),
+                                                    status=502)
+                self._sse_stream_error(self._upstream_error)
 
         def _sse(self, obj):
             if isinstance(obj, str):
@@ -980,15 +1042,16 @@ def make_handler(app):
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
             })
 
-        def _stream_openai(self, resp, slug, t0, first_byte_timeout=None, stream_read_timeout=None):
-            cid = "chatcmpl-" + uuid.uuid4().hex[:24]
-            created = int(time.time())
-            self._start_stream("text/event-stream; charset=utf-8")
-
+        def _pump_stream(self, resp, slug, t0, cid=None, created=None,
+                         first_byte_timeout=None, stream_read_timeout=None):
+            """Forwards upstream deltas as SSE chunks (headers/role already sent)."""
+            if cid is None:
+                cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+            if created is None:
+                created = int(time.time())
             stream_state = {}
             model_seen = slug
             try:
-                self._chunk(cid, created, model_seen, {"role": "assistant", "content": ""})
                 for delta in app.client.iter_deltas(
                         resp, stream_state,
                         first_byte_timeout=first_byte_timeout,
