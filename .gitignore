@@ -7,6 +7,7 @@ venv/
 # secrets / local config
 config.json
 cookie.txt
+gpt_cookie.txt
 gemini-auth.json
 .env
 server.log
