@@ -5,7 +5,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# All licenses ride with the image (testing-only distribution — see TESTING-ONLY.md).
+COPY LICENSE NOTICE THIRD-PARTY-LICENSES.md TESTING-ONLY.md ./
 COPY gemini_web2api ./gemini_web2api
+COPY chatgptwebapp2api ./chatgptwebapp2api
 
 # Railway supplies PORT; default 8000 for local docker runs.
 # Secrets (PROXY_API_KEY, cookie) are injected via environment/volumes — never baked in.

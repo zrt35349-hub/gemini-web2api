@@ -324,3 +324,4 @@ Variables se aati hain. Binna cookie Railway par anonymous Flash models chalenge
 - Dependency licenses: `THIRD-PARTY-LICENSES.md`.
 - "ChatGPT" (OpenAI) aur "Gemini" (Google) unke owners ke trademarks hain;
   ye project unofficial hai, unse affiliated nahi.
+- **Testing purposes only — production/fair use ke liye nahi** (dekho `TESTING-ONLY.md`).
